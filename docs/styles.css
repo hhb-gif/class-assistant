@@ -2376,3 +2376,162 @@ body.role-guest {
 @media (max-width: 560px) {
   #brand-sub::after { content: ""; }
 }
+
+/* ==========================================================================
+   22. 移动端适配层（Mobile · 重点 360–430px）
+   依据：DESIGN.md §8（响应式）/ §10（角色差异）/ §13。只新增与增强，
+   不删除任何既有类名与 token。本层置于文件末尾，用于压过 §18/§20/§21 中
+   同特异度的既有规则（同特异度时源码顺序在后者胜出）。
+   分组：22.1 防溢出 → 22.2 顶栏 → 22.3 底部导航 → 22.4 主视觉横幅
+        → 22.5 表格 → 22.6 卡片/统计/表单 → 22.7 分段与胶囊
+        → 22.8 反馈 → 22.9 超窄屏 → 22.10 副标题 → 22.11 动效降级
+   ========================================================================== */
+
+/* ---- 22.1 防溢出兜底：页面级不横向滚动；长串/代码块一律断行 ---- */
+@media (max-width: 767px) {
+  html, body { overflow-x: hidden; }
+  #topbar, #ca-hero, #view-root, #tabbar { max-width: 100%; }
+  .md, .detail-content, .ca-review-overview, .ca-review-point-text,
+  .notice-title, .list-title-text, .card-sub, .empty-desc, .modal-hint,
+  .ca-msg-content { overflow-wrap: anywhere; }
+  pre, .md pre, code { max-width: 100%; overflow-x: auto; }
+}
+
+/* ---- 22.2 顶栏精简：AI 开关收为纯开关 · 身份只留角色徽标 ---- */
+@media (max-width: 767px) {
+  #topbar { padding: 0 10px; gap: 8px; }
+  #brand { font-size: 15px; gap: 7px; min-width: 0; }
+  #brand::before { width: 20px; height: 20px; }
+  #topbar-right { gap: 6px; min-width: 0; }
+
+  /* AI 开关：视觉上只保留开关本体；文字用 sr-only 手法隐藏（保留可访问名） */
+  #ai-toggle-wrap { padding: 3px 7px; gap: 0; min-height: 36px; }
+  #ai-toggle-wrap > span {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+
+  /* 身份标签：只保留角色徽标（姓名由横幅「xx，欢迎回来」承担），避免顶栏挤压 */
+  #role-switcher { max-width: none; padding: 5px 12px; font-size: 12px; }
+  #role-switcher > span:not(.badge) { display: none; }
+
+  /* 退出登录：紧凑但仍可点（≥38px） */
+  #btn-logout { min-height: 38px; padding: 4px 10px; font-size: 12px; }
+}
+
+/* ---- 22.3 底部导航：等宽不换行 · 不溢出 · safe-area —— 6 项在 360px 亦不横滚 ---- */
+@media (max-width: 767px) {
+  #tabbar {
+    padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px));
+    overflow-x: hidden;
+  }
+  .nav-item {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 48px;
+    padding: 5px 2px;
+    gap: 2px;
+  }
+  .nav-item .nav-icon { width: 19px; height: 19px; }
+  .nav-item .nav-label {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11px;
+  }
+}
+
+/* ---- 22.4 主视觉横幅：纯色块 + 高度收敛（目标 ≤104px） ---- */
+@media (max-width: 767px) {
+  .ca-hero { padding: 8px 12px 0; }
+  .ca-hero-inner { padding: 12px 14px; gap: 10px; }
+  .ca-hero-title { font-size: 18px; }
+  .ca-hero-sub {
+    margin-top: 4px;
+    font-size: var(--fs-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap; /* 单行，防止横幅被撑高 */
+  }
+  /* 兜底：即使某种角色下插画未被隐藏，也压到矮幅 */
+  .ca-hero-art { height: 96px; }
+}
+
+/* ---- 22.5 表格：容器内横滚（页面本身不横滚）+ 首列 sticky 已由 §18 提供 ---- */
+@media (max-width: 767px) {
+  .table-wrap { -webkit-overflow-scrolling: touch; box-shadow: var(--shadow-xs); }
+  .table th, .table td { padding: 10px 12px; }
+  .table-compact th, .table-compact td { padding: 8px 10px; }
+}
+
+/* ---- 22.6 卡片 / 统计 / 表单 / 动作区 ---- */
+@media (max-width: 767px) {
+  .card, .skeleton-card { padding: 14px; }
+  .card + .card { margin-top: var(--sp-3); }
+  .card-head { gap: 8px; margin-bottom: 12px; }
+  .card-foot { gap: 8px; }
+  .card-foot .btn { flex: 1 1 auto; }
+
+  .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .stat, .skeleton-row { padding: 12px; }
+  .stat-label { font-size: var(--fs-xs); }
+
+  .check { min-height: 44px; }
+  .form-actions { gap: 8px; }
+  .form-actions .btn { min-height: 44px; }
+  .btn-sm { min-height: 40px; }
+  .btn-group, .manage-actions { flex-wrap: wrap; }
+  .manage-actions { row-gap: 8px; }
+
+  .metric-strip { gap: 8px 16px; }
+  .attach { max-width: 100%; }
+}
+
+/* ---- 22.7 分段控件 / 胶囊 / 筛选：触控放大 ---- */
+@media (max-width: 767px) {
+  .segmented { box-shadow: var(--shadow-xs); }
+  .seg-item, .segmented > button, .seg-btn { min-height: 40px; padding: 7px 13px; }
+  .chip { min-height: 32px; padding: 6px 12px; }
+  .filter-btn { min-height: 40px; }
+}
+
+/* ---- 22.8 反馈：toast / modal 适配可视宽度 ---- */
+@media (max-width: 767px) {
+  #toast {
+    max-width: calc(100vw - 24px);
+    padding: 10px 14px;
+    font-size: var(--fs-sm);
+  }
+  #modal-mask { padding: 12px; }
+  #modal-box { max-height: 88vh; padding: 18px; border-radius: var(--r-lg); }
+  .modal-actions { gap: 8px; }
+  .modal-actions .btn { flex: 1 1 auto; }
+}
+
+/* ---- 22.9 超窄屏（≤430）：顶栏与留白再收一档 ---- */
+@media (max-width: 430px) {
+  #topbar { padding: 0 8px; gap: 6px; }
+  #brand { font-size: 14px; }
+  #btn-logout { padding: 4px 8px; }
+  .ca-hero-title { font-size: 17px; }
+  #view-root { padding-left: 10px; padding-right: 10px; }
+  .ca-hero { padding-left: 10px; padding-right: 10px; }
+  .stat-grid { gap: 8px; }
+  .stat, .skeleton-row { padding: 10px; }
+}
+
+/* ---- 22.10 品牌副标题整块隐藏（§18/§21 仅清空 ::after，会残留空胶囊） ---- */
+@media (max-width: 560px) {
+  #brand-sub { display: none; }
+}
+
+/* ---- 22.11 动效降级：覆盖新增的横幅 / 视图入场动画 ---- */
+@media (prefers-reduced-motion: reduce) {
+  #ca-hero > .ca-hero-inner,
+  #view-root > section,
+  .ca-enter .list-row, .ca-enter .list-item, .ca-enter .stat,
+  .ca-enter .chart-box, .ca-enter .card-list > .card {
+    animation: none !important;
+    transform: none !important;
+  }
+}

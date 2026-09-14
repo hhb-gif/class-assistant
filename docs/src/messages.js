@@ -122,7 +122,14 @@ window.CA = window.CA || {};
       ".ca-messages .ca-msg-reply-form{margin-top:12px;display:flex;flex-direction:column;gap:8px}" +
       ".ca-messages .ca-msg-reply-form .row{gap:8px;flex-wrap:wrap}" +
       ".ca-messages .ca-msg-reply-form textarea{min-height:56px;resize:vertical}" +
-      "@media(max-width:520px){.ca-messages .ca-msg-actions .ca-msg-count{margin-left:0;width:100%}}";
+      "@media(max-width:520px){.ca-messages .ca-msg-actions .ca-msg-count{margin-left:0;width:100%}}" +
+      // 移动端：操作按钮可换行并撑满一行，长文本/回复表单不挤出容器
+      "@media(max-width:767px){" +
+      ".ca-messages{gap:12px}" +
+      ".ca-messages .ca-msg-reply-form .row .btn{flex:0 1 auto}" +
+      ".ca-messages .ca-msg-reply-form textarea{min-height:64px}" +
+      "}" +
+      "@media(max-width:430px){.ca-messages .ca-msg-actions .btn{flex:1 1 auto}}";
     var style = document.createElement("style");
     style.setAttribute("type", "text/css");
     style.textContent = css;

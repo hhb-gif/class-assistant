@@ -352,7 +352,16 @@ window.CA = window.CA || {};
       ".ca-collect .ai-compose{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}" +
       ".ca-collect .ai-compose .ai-compose-note{font-size:var(--fs-xs);color:var(--text-3)}" +
       "@media(max-width:768px){.ca-collect .opt-row{grid-template-columns:1fr auto;grid-template-areas:'name count' 'bar bar'}" +
-      ".ca-collect .opt-row .opt-name{grid-area:name}.ca-collect .opt-row .opt-count{grid-area:count}.ca-collect .opt-row .bar{grid-area:bar}}";
+      ".ca-collect .opt-row .opt-name{grid-area:name}.ca-collect .opt-row .opt-count{grid-area:count}.ca-collect .opt-row .bar{grid-area:bar}}" +
+      // 移动端：列表行与题头允许换行，动作按钮另起一行右对齐，避免窄屏挤压主信息
+      "@media(max-width:767px){" +
+      ".ca-collect{gap:12px}" +
+      ".ca-collect .q-item{padding:10px}" +
+      ".ca-collect .q-head{flex-wrap:wrap}" +
+      ".ca-collect .list-row{flex-wrap:wrap}" +
+      ".ca-collect .list-row .row{flex-wrap:wrap;width:100%;justify-content:flex-end}" +
+      ".ca-collect .ai-compose{margin-top:6px}" +
+      "}";
     var style = document.createElement("style");
     style.setAttribute("type", "text/css");
     style.textContent = css;

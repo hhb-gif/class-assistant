@@ -262,8 +262,17 @@ window.CA = window.CA || {};
       ".ca-review-lib-row .list-meta { font-size: var(--fs-sm); color: var(--text-3); }",
       "@media (max-width: 767px) {",
       "  #review-tabs { align-self: stretch; }",
-      "  .ca-review-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }",
+      "  .ca-review-content { padding: 14px; }",
+      "  .ca-review-upload { padding: 18px 12px; }",
+      "  .ca-review-docbar { gap: 8px; }",
+      // 窄屏标题/资料名改为可换行，避免被 ellipsis 截断关键信息
+      "  .ca-review-doc-title { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }",
+      "  .ca-review-actions { flex: 1 1 100%; justify-content: flex-start; flex-wrap: wrap; gap: 8px; }",
+      "  .ca-review-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }",
       "  .ca-review-lib-row { flex-wrap: wrap; }",
+      "  .ca-review-lib-row .list-title { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }",
+      "  .ca-review-block-title { font-size: var(--fs-base); }",
+      "  .ca-review-overview { font-size: var(--fs-base); }",
       "}"
     ].join("\n");
     var style = document.createElement("style");

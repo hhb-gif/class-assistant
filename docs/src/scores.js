@@ -462,7 +462,11 @@ window.CA = window.CA || {};
       // v4 主色底概览（.card-ink）内的 KPI 浅色磁贴：恢复深色文字（否则 .card-ink 的反白规则会让数字不可见）；
       // 语义色（.stat.success/.warn/.danger/.emphasis，特异度更高）不受影响，仍然生效。
       ".scores-view .stat-value{color:var(--text)}" +
-      ".scores-view .stat-label{color:var(--text-3)}";
+      ".scores-view .stat-label{color:var(--text-3)}" +
+      // 移动端：表格内行内输入加大触控高度（≥42px），分数列窄一点给数字列留位
+      "@media(max-width:767px){" +
+      ".scores-view .table input.num{width:64px;height:42px;font-size:var(--fs-base)}" +
+      "}";
     const style = document.createElement("style");
     style.setAttribute("type", "text/css");
     style.textContent = css;
