@@ -111,3 +111,7 @@ node docs/test/messages_test.mjs   # 留言             43
 
 - [review-helper](https://github.com/hhb-gif/review-mate) — 复习引擎与 LLM 服务层来源（本项目复用其引擎，UI 自研）
 - [Cheems-sudo/Class-Box](https://github.com/Cheems-sudo/Class-Box)（MIT）— 数据库与权限设计的参考
+
+## 许可
+
+[MIT](LICENSE) © 2026 hhb-gif
