@@ -710,13 +710,15 @@ CA.views.notices = (function () {
       stagger(list);
     });
 
-    // 列表点击 → 详情：委托
+    // 列表点击 → 详情：委托（toggle：点当前已选中项则取消选中并收起详情）
     list.addEventListener("click", function (e) {
       var item = closestData(e.target || e.srcElement, "noticeId");
       if (!item) return;
-      state.detailId = item.dataset.noticeId;
-      renderList();    // 更新选中态
-      renderDetail();
+      var id = item.dataset.noticeId;
+      // 点同一条 → 取消选中；点另一条 → 照旧切换展开
+      state.detailId = (state.detailId === id) ? null : id;
+      renderList();    // 更新选中态（is-active / aria-expanded）
+      renderDetail();  // detailId 为空时渲染「未选择通知」空态
     });
 
     // 详情操作：委托（收藏 / 编辑 / 删除 / 附件下载提示）
@@ -929,7 +931,10 @@ CA.views.notices = (function () {
     var item = h("div", { class: "list-row" });
     item.dataset.noticeId = n.id;
     item.dataset.cat = n.category || "";
-    if (state.detailId === n.id) item.className += " is-active";
+    // 选中态：同时用类名（视觉）与 aria-expanded（可访问性）表达展开/收起
+    var active = state.detailId === n.id;
+    if (active) item.className += " is-active";
+    item.setAttribute("aria-expanded", active ? "true" : "false");
 
     var main = h("div", { class: "list-main" });
 

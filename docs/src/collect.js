@@ -540,7 +540,9 @@ window.CA = window.CA || {};
     var total = ((state && state.members) || []).length;
     var submitted = progressOf(s.id);
 
-    var row = h("div", { class: "list-row", "data-survey-id": s.id, role: "button", tabindex: "0" });
+    var row = h("div", { class: "list-row" + (state.selectedId === s.id ? " is-active" : ""), "data-survey-id": s.id, role: "button", tabindex: "0" });
+    // 选中态：类名（视觉，复用全局 .list-row.is-active）+ aria-expanded（可访问性）
+    row.setAttribute("aria-expanded", state.selectedId === s.id ? "true" : "false");
     var main = h("div", { class: "list-main" });
 
     var title = h("div", { class: "list-title" }, [
@@ -570,13 +572,23 @@ window.CA = window.CA || {};
     row.appendChild(iconEl("chevron-right", 16));
     row.appendChild(side);
 
-    row.addEventListener("click", function () { selectSurvey(s.id); });
+    row.addEventListener("click", function () { toggleSurvey(s.id); });
     return row;
   }
 
   // ============================================================
   // 详情分发
   // ============================================================
+  // 列表点击 toggle：点当前已选中项 → 收起详情并取消选中；点其他项 → 切换展开
+  function toggleSurvey(id) {
+    if (state.selectedId === id) {
+      clearDetail();
+    } else {
+      selectSurvey(id);
+    }
+    renderList();   // 同步列表选中态（is-active / aria-expanded）
+  }
+
   function selectSurvey(id) {
     state.selectedId = id;
     state.reEditing = false;

@@ -518,6 +518,25 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   await flush();
   ok((await CA.store.find("surveys", "sv_stat")).status === "open", "重开写入 status=open");
 
+  console.log("\n== G2. 列表点击 toggle（再点同一条 → 收起） ==");
+  ok(row("sv_stat").getAttribute("aria-expanded") === "true" &&
+     row("sv_stat").className.indexOf("is-active") >= 0, "已选中项：.is-active + aria-expanded=true");
+  click(row("sv_stat"));   // 再点同一条
+  await flush();
+  ok(root.querySelector("#collect-detail").hidden === true, "再次点击同一条 → 详情收起（hidden）");
+  ok(root.querySelector("#collect-detail").children.length === 0, "收起后详情内容清空");
+  ok(row("sv_stat").getAttribute("aria-expanded") === "false" &&
+     row("sv_stat").className.indexOf("is-active") < 0, "收起后列表项移除 .is-active / aria-expanded=false");
+  // 点另一条：选中态转移，仍正常展开
+  click(row("sv_b"));
+  await flush();
+  ok(root.querySelector("#collect-detail").hidden === false, "点击另一条 → 详情展开");
+  ok(row("sv_b").getAttribute("aria-expanded") === "true" &&
+     row("sv_stat").getAttribute("aria-expanded") === "false", "选中态转移到 sv_b");
+  click(row("sv_b"));   // 再点当前条
+  await flush();
+  ok(root.querySelector("#collect-detail").hidden === true, "再次点击当前条 → 再次收起");
+
   console.log("\n== H. 学生视角：只列进行中 / 已截止不可填 ==");
   setUser("u_s");
   await remount();

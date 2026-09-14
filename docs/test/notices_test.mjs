@@ -432,6 +432,34 @@ function formField(name) { return root.querySelector('#notice-form [name="' + na
   click(catButton("全部"));
   ok(root.querySelectorAll("#notices-list .list-row").length === 5, "切回「全部」→ 5 条");
 
+  console.log("\n== C2. 列表点击 toggle（再点同一条 → 收起） ==");
+  ok(itemById("n1").getAttribute("aria-expanded") === "false", "初始未选中项 aria-expanded=false");
+  click(itemById("n1"));
+  ok(itemById("n1").className.indexOf("is-active") >= 0 &&
+     itemById("n1").getAttribute("aria-expanded") === "true",
+    "首次点击 → 选中态（.is-active + aria-expanded=true）");
+  ok(root.querySelector("#notice-detail").textContent.indexOf("期中考试安排") >= 0,
+    "首次点击 → 详情展开并显示该通知");
+  click(itemById("n1"));   // 重新取元素（renderList 会重建列表）
+  ok(root.querySelector("#notice-detail").textContent.indexOf("未选择通知") >= 0,
+    "再次点击同一条 → 详情回到「未选择通知」空态");
+  ok(root.querySelector("#notice-detail").textContent.indexOf("期中考试安排") < 0,
+    "收起后详情不再包含该通知内容");
+  ok(itemById("n1").className.indexOf("is-active") < 0 &&
+     itemById("n1").getAttribute("aria-expanded") === "false",
+    "取消选中 → 列表项移除 .is-active / aria-expanded=false");
+  // 点另一条：选中态转移，仍正常展开
+  click(itemById("n1"));
+  click(itemById("n2"));
+  ok(itemById("n2").getAttribute("aria-expanded") === "true" &&
+     itemById("n1").getAttribute("aria-expanded") === "false",
+    "点击另一条 → 选中态由 n1 转移到 n2");
+  ok(root.querySelector("#notice-detail").textContent.indexOf("数学作业提交") >= 0,
+    "切换另一条 → 详情更新为 n2");
+  click(itemById("n2"));
+  ok(root.querySelector("#notice-detail").textContent.indexOf("未选择通知") >= 0,
+    "再点当前条 → 再次收起（toggle 可反复）");
+
   console.log("\n== D. 发布：字段完整（异步 store） ==");
   setUser("u_a"); // admin
   await remount();

@@ -213,6 +213,7 @@
 | ⚠️ 部署缓存 | 静态托管边缘会缓存 JS；`index.html` 本地资源统一带 `?v=<版本>`，**每次部署须 bump 版本号** |
 | 🌐 访问地址① | `https://class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com/`（静态托管默认域） |
 | 🌐 访问地址② | `https://class-assistant-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`（webapps 子域，`*.webapps.tcloudbase.com` 已在安全域名白名单）✅ |
+| 🌐 访问地址③ | `https://app-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`（**短子域，推荐**，服务名 `app`）✅ |
 | 🔑 密钥 | DeepSeek Key 存于云函数环境变量 `AI_API_KEY`（不入库）；**建议使用后轮换** |
 
 ## 9. 待决问题
@@ -237,6 +238,7 @@
 | 2026-09-14 | v1.5 | UI 配色和谐化（墨蓝+陶土橙）＋ 复习改为 **CA 原生 UI + RH 引擎**（弃 iframe）＋ Agnes 资产按新色板重出 ＋ 复习 AI 接入 CloudBase 网关；浏览器实测通过 |
 | 2026-09-14 | v1.6 | 应用户反馈：`.card-ink` 黑底→主色蓝；复习减少框嵌套（4→2 卡）；精简「演示」等废话文案；**新增「留言」Tab**（学生→老师，含回复闭环）；**通知附件真上传/下载** + 存储 RLS；浏览器实测通过 |
 | 2026-09-14 | v1.7 | 移除「高二(3)班」文案；**新增 webapps 子域**并实测登录可用；**移动端适配**（底部 6 项导航/紧凑顶栏/响应式卡片，390px 实测）；git 提交推送 |
+| 2026-09-14 | v1.8 | 修复 index.html 漏载 `collect.js`（收集恢复）；新增**短子域** `app-…`；通知/收集**点按收起**（toggle，`aria-expanded` 同步） |
 
 ---
 
