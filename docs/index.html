@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="班级管家 · 本地原型（通知 / 成绩 / 收集 / 复习 / 设置）">
+  <title>班级管家 · 高二(3)班演示</title>
+
+  <link rel="stylesheet" href="styles.css">
+
+  <!-- ECharts 5（CDN）：加载失败不阻塞页面，charts.js 自动降级为 CSS 条形图 -->
+  <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
+
+  <!-- 复习模块：解析与导出依赖（CDN，失败不阻塞页面，功能按需降级） -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- pdf.js worker（必须在使用前设置） -->
+  <script>if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+</head>
+<body>
+  <!-- ===== 顶栏 ===== -->
+  <header id="topbar">
+    <div id="brand">班级管家<span id="brand-sub">高二(3)班演示</span></div>
+    <div id="topbar-right">
+      <label id="ai-toggle-wrap" title="AI 助手开关">
+        <input type="checkbox" id="ai-toggle"><span>AI 助手</span>
+      </label>
+      <select id="role-switcher" aria-label="切换身份"></select>
+    </div>
+  </header>
+
+  <!-- ===== 主导航（app.js 绑定 data-view，并管理 .active 类） ===== -->
+  <nav id="tabbar" aria-label="主导航">
+    <button class="nav-item active" type="button" data-view="notices">通知</button>
+    <button class="nav-item" type="button" data-view="scores">成绩</button>
+    <button class="nav-item" type="button" data-view="collect">收集</button>
+    <button class="nav-item" type="button" data-view="review">复习</button>
+    <button class="nav-item" type="button" data-view="settings">设置</button>
+  </nav>
+
+  <!-- ===== 视图根容器（app.js 清空后挂载当前视图 section） ===== -->
+  <main id="view-root">
+    <section class="empty view-placeholder" aria-live="polite">
+      <div class="empty-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+      </div>
+      <div class="empty-title">正在加载班级管家…</div>
+      <p class="empty-desc">若长时间停留在本页，说明视图模块（<code>docs/src/app.js</code> 等）尚未就位；这不影响样式预览。</p>
+    </section>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="modal-mask" hidden><div id="modal-box" role="dialog" aria-modal="true"></div></div>
+
+  <!-- ===== 脚本加载顺序（契约第 2 节，严格依次）：文件缺失时 404 静默 ===== -->
+  <script src="src/config.js"></script>
+  <script src="src/llm.js"></script>
+  <script src="src/store.js"></script>
+  <script src="src/seed.js"></script>
+  <script src="src/auth.js"></script>
+  <script src="src/charts.js"></script>
+  <script src="src/ai.js"></script>
+  <script src="src/icons.js"></script>
+  <script src="src/notices.js"></script>
+  <script src="src/scores.js"></script>
+  <script src="src/collect.js"></script>
+  <!-- 复习能力模块（RH 原样移植，window.RH 命名空间；顺序契约见 REVIEW.md §1.3） -->
+  <script src="src/review/rules.js"></script>
+  <script src="src/review/tokenizer.js"></script>
+  <script src="src/review/newword.js"></script>
+  <script src="src/review/keywords.js"></script>
+  <script src="src/review/textrank.js"></script>
+  <script src="src/review/selection.js"></script>
+  <script src="src/review/semantic.js"></script>
+  <script src="src/review/sm2.js"></script>
+  <script src="src/review/storage.js"></script>
+  <script src="src/review/quiz.js"></script>
+  <script src="src/review/summarize.js"></script>
+  <script src="src/review/quizgen.js"></script>
+  <script src="src/review/llm.js"></script>
+  <script src="src/review/exporter.js"></script>
+  <script src="src/review/parsers.js"></script>
+  <script src="src/review/pipeline.js"></script>
+  <script src="src/review-view.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>

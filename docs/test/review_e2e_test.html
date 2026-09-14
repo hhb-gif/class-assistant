@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>复习链路 E2E 测试（解析 → AI 要点/出题 → 存储 → 视图）</title>
+  <link rel="stylesheet" href="../styles.css">
+  <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script>if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+</head>
+<body>
+  <header id="topbar">
+    <div id="brand">E2E 测试<span id="brand-sub">复习链路</span></div>
+    <div id="topbar-right">
+      <label id="ai-toggle-wrap"><input type="checkbox" id="ai-toggle"><span>AI 助手</span></label>
+      <select id="role-switcher"></select>
+    </div>
+  </header>
+  <nav id="tabbar">
+    <button class="nav-item active" type="button" data-view="notices">通知</button>
+    <button class="nav-item" type="button" data-view="scores">成绩</button>
+    <button class="nav-item" type="button" data-view="collect">收集</button>
+    <button class="nav-item" type="button" data-view="review">复习</button>
+    <button class="nav-item" type="button" data-view="settings">设置</button>
+  </nav>
+  <main id="view-root"></main>
+  <div id="toast"></div>
+  <div id="modal-mask" hidden><div id="modal-box"></div></div>
+
+  <pre id="out" style="padding:16px;font:12px/1.6 Consolas,monospace;white-space:pre-wrap">RUNNING</pre>
+
+  <script src="../src/config.js"></script>
+  <script src="../src/llm.js"></script>
+  <script src="../src/store.js"></script>
+  <script src="../src/seed.js"></script>
+  <script src="../src/auth.js"></script>
+  <script src="../src/charts.js"></script>
+  <script src="../src/ai.js"></script>
+  <script src="../src/icons.js"></script>
+  <script src="../src/notices.js"></script>
+  <script src="../src/scores.js"></script>
+  <script src="../src/collect.js"></script>
+  <script src="../src/review/rules.js"></script>
+  <script src="../src/review/tokenizer.js"></script>
+  <script src="../src/review/newword.js"></script>
+  <script src="../src/review/keywords.js"></script>
+  <script src="../src/review/textrank.js"></script>
+  <script src="../src/review/selection.js"></script>
+  <script src="../src/review/semantic.js"></script>
+  <script src="../src/review/sm2.js"></script>
+  <script src="../src/review/storage.js"></script>
+  <script src="../src/review/quiz.js"></script>
+  <script src="../src/review/summarize.js"></script>
+  <script src="../src/review/quizgen.js"></script>
+  <script src="../src/review/llm.js"></script>
+  <script src="../src/review/exporter.js"></script>
+  <script src="../src/review/parsers.js"></script>
+  <script src="../src/review/pipeline.js"></script>
+  <script src="../src/review-view.js"></script>
+  <script src="../src/app.js"></script>
+
+  <script>
+    var SAMPLE = [
+      "细胞呼吸是指有机物在细胞内经过一系列的氧化分解，生成二氧化碳或其他产物，并释放能量生成 ATP 的过程。",
+      "细胞呼吸分为有氧呼吸和无氧呼吸两种类型。有氧呼吸的主要场所是线粒体，全过程分为三个阶段：第一阶段在细胞质基质中进行，葡萄糖分解为丙酮酸；第二阶段在线粒体基质中进行，丙酮酸彻底分解并释放二氧化碳；第三阶段在线粒体内膜上进行，前两阶段产生的还原氢与氧结合生成水，释放大量能量。",
+      "无氧呼吸的场所是细胞质基质，产物是酒精和二氧化碳，或者是乳酸。无氧呼吸释放的能量较少，但能在缺氧条件下为细胞提供能量。",
+      "光合作用是绿色植物通过叶绿体利用光能，把二氧化碳和水转化成储存能量的有机物，并释放氧气的过程。",
+      "光合作用分为光反应和暗反应两个阶段。光反应在类囊体薄膜上进行，水的光解产生氧气和还原氢，同时合成 ATP。暗反应在叶绿体基质中进行，二氧化碳被固定后经还原生成有机物。"
+    ].join("");
+
+    window.addEventListener("load", function () {
+      setTimeout(async function () {
+        var out = [], el = document.getElementById("out");
+        function log(s) { out.push(s); el.textContent = out.join("\n"); }
+        try {
+          log("RH.llm.ready = " + (window.RH && RH.llm && RH.llm.ready ? RH.llm.ready() : "N/A"));
+          var doc = RH.parsers.parseTxt(SAMPLE, "生物学核心概念");
+          log("1) 解析 ok: sections=" + doc.sections.length + ", blocks=" + doc.sections.reduce(function (a, s) { return a + s.blocks.length; }, 0));
+
+          var vm = await RH.pipeline.run(doc, function (stage, msg) { log("   [" + stage + "] " + msg); });
+          log("2) 管线 ok: engine=" + vm.engine + ", 章节=" + vm.sections.length + ", 题数=" + vm.quiz.length + ", overview=" + ((vm.overview || "").length) + "字, backend=" + vm.backend);
+
+          await RH.storage.saveDoc(vm.title, {
+            title: vm.title, time: Date.now(), backend: vm.backend, overview: vm.overview, engine: vm.engine,
+            sections: vm.sections, quiz: vm.quiz, keywords: vm.keywords, terms: vm.terms,
+            original_sections: vm.original_sections, markdown: "", sourceBlob: null, sourceName: "", sourceNames: []
+          });
+          var docs = await RH.storage.listDocs();
+          log("3) 存储 ok: 资料库 " + docs.length + " 篇 → " + docs.map(function (d) { return d.title; }).join(" / "));
+
+          CA.app.switchView("review");
+          await new Promise(function (r) { setTimeout(r, 500); });
+          log("4) 视图 ok: #review-upload=" + !!document.getElementById("review-upload") +
+              ", #review-tabs=" + !!document.getElementById("review-tabs") +
+              ", #review-sections=" + !!document.getElementById("review-sections"));
+          log("== E2E PASS ==");
+        } catch (e) {
+          log("== E2E FAIL: " + (e && e.message || e) + " ==");
+        }
+      }, 300);
+    });
+  </script>
+</body>
+</html>

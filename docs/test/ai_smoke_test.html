@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>AI 链路冒烟测试（浏览器 · 真实调用）</title>
+</head>
+<body>
+  <h3>AI 链路冒烟测试</h3>
+  <p class="hint">加载依赖 → 调 CA.ai.parseNotice 一次 → 把结果写入 #out。用 Chrome headless --dump-dom 抓取。</p>
+  <pre id="out">RUNNING</pre>
+
+  <script src="../src/config.js"></script>
+  <script src="../src/llm.js"></script>
+  <script src="../src/store.js"></script>
+  <script src="../src/seed.js"></script>
+  <script src="../src/auth.js"></script>
+  <script src="../src/charts.js"></script>
+  <script src="../src/ai.js"></script>
+  <script>
+    (async function () {
+      var out = document.getElementById("out");
+      var t0 = Date.now();
+      try {
+        if (!(window.CA && CA.ai && CA.ai.enabled())) { out.textContent = "SKIP: AI 未就绪"; return; }
+        var draft = await CA.ai.parseNotice("下周三下午3点在教学楼报告厅开家长会，请同学们通知家长，务必带好成绩单");
+        out.textContent = "OK|" + (Date.now() - t0) + "ms|" + JSON.stringify(draft);
+      } catch (e) {
+        out.textContent = "ERR|" + (Date.now() - t0) + "ms|" + ((e && e.message) || String(e));
+      }
+    })();
+  </script>
+</body>
+</html>

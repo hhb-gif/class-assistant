@@ -1,0 +1,21 @@
+# 微信开发者工具个人配置
+project.private.config.json
+project.config.json
+
+# 含密配置（模板为 config.example.js）
+miniprogram/config.js
+cloudfunctions/**/config.js
+.env
+
+# 依赖与产物
+node_modules/
+package-lock.json
+
+# 临时文件与测试数据（真实名单/成绩不入库）
+temp/
+*.local.*
+data/real-*
+
+# 系统文件
+Thumbs.db
+.DS_Store
