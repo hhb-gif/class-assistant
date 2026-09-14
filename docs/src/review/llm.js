@@ -1,10 +1,33 @@
-﻿// LLM 服务层 v2 —— 内置单点配置（window.RH_CONFIG.llm），用户端无任何设置入口
-// 契约：docs/CONTRACT-v2.md 第 2 节
+﻿// LLM 服务层 v3 —— 优先委托 CloudBase 云函数网关（window.CA.llm），缺失/不可用时回退内置 fetch 代理
+// 契约：docs/CONTRACT-v2.md 第 2 节；对外 API 与 v2 完全一致
+// 背景：静态托管域直连 RH SCF 代理会 403；主文档 CA.llm 已改走 app.callFunction("ai-gateway")，复习模块复用同一通道。
 window.RH = window.RH || {};
 
 RH.llm = (function () {
 
-  // ---------- 配置 ----------
+  // ---------- 委托层：优先 window.CA.llm（CloudBase 云函数网关） ----------
+  function caLlm() {
+    try { return (window.CA && window.CA.llm) || null; } catch (e) { return null; }
+  }
+
+  // CA.llm 存在且其 ready() 为真 → 走网关；否则回退内置 fetch 实现（本地/冒烟页仍可用）
+  function caReady() {
+    var c = caLlm();
+    try { return !!(c && typeof c.ready === "function" && c.ready()); } catch (e) { return false; }
+  }
+
+  // RH opts → CA.chat opts 参数映射：同名同义字段直传；RH 专有 thinking 网关不支持（丢弃，不影响其余参数）
+  function mapOpts(opts) {
+    var o = opts || {};
+    var out = {};
+    if (o.temperature != null) out.temperature = o.temperature;
+    if (o.maxTokens != null) out.maxTokens = o.maxTokens;
+    if (o.jsonMode != null) out.jsonMode = o.jsonMode;
+    if (o.timeoutMs != null) out.timeoutMs = o.timeoutMs;
+    return out;
+  }
+
+  // ---------- 配置（回退路径：window.RH_CONFIG.llm 的单点 fetch 代理配置） ----------
   function cfg() {
     try {
       const c = window.RH_CONFIG && window.RH_CONFIG.llm;
@@ -13,11 +36,23 @@ RH.llm = (function () {
     } catch (e) { return null; }
   }
 
-  // 配置完整即视为 ready（真实可用性由调用时的错误处理兜底，失败走管线降级）
-  function ready() { return !!cfg(); }
+  // 就绪判定：CA.llm 存在 → 以网关就绪为准；否则本地配置完整即视为 ready
+  //（真实可用性仍由调用时的错误处理兜底，失败走管线降级）
+  function ready() {
+    if (caLlm()) return caReady();
+    return !!cfg();
+  }
 
-  // 引擎信息（徽标 / backend 标注用）
+  // 引擎信息（徽标 / backend 标注用）：CA.llm 存在优先转发，否则读本地配置
   function info() {
+    var c = caLlm();
+    if (c && typeof c.info === "function") {
+      try { var i = c.info(); if (i) return i; } catch (e) { /* 回退本地 */ }
+    }
+    return localInfo();
+  }
+
+  function localInfo() {
     const c = cfg();
     if (!c) return { model: "", keyMasked: "" };
     let masked = "";
@@ -46,8 +81,8 @@ RH.llm = (function () {
   // 调试/测试用（下划线约定：非业务接口）
   function _setNetFailed(at) { _netFailedAt = at; }
 
-  // ---------- chat（OpenAI 兼容 /chat/completions） ----------
-  async function chat(messages, opts) {
+  // ---------- 回退实现：内置 fetch（OpenAI 兼容 /chat/completions） ----------
+  async function localChat(messages, opts) {
     const c = cfg();
     if (!c) throw new Error("未配置 LLM API（缺 src/config.js）");
     if (unreachableNow()) throw new Error("网络不可达（AI 服务暂连不上，本会话改走离线，5 分钟后自动重试）");
@@ -99,6 +134,15 @@ RH.llm = (function () {
     }
   }
 
+  // ---------- chat（网关优先 → fetch 回退） ----------
+  async function chat(messages, opts) {
+    var c = caLlm();
+    if (c && typeof c.chat === "function" && caReady()) {
+      return c.chat(messages, mapOpts(opts));   // 委托：错误按 CA 语义抛出，不再二次回退
+    }
+    return localChat(messages, opts);
+  }
+
   // ---------- JSON 提取与稳健生成 ----------
   function extractJson(text) {
     const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -109,18 +153,27 @@ RH.llm = (function () {
     return JSON.parse(raw.slice(start, end + 1));
   }
 
-  // jsonMode 生成 + 解析失败自动重试 1 次（温度 +0.2）
-  async function generateJson(messages, opts) {
+  // 回退路径：jsonMode 生成 + 解析失败自动重试 1 次（温度 +0.2）
+  async function localGenerateJson(messages, opts) {
     const o = opts || {};
     const baseTemp = o.temperature != null ? o.temperature : 0.3;
     try {
-      const text = await chat(messages, { ...o, jsonMode: true, temperature: baseTemp });
+      const text = await localChat(messages, { ...o, jsonMode: true, temperature: baseTemp });
       return extractJson(text);
     } catch (e) {
       if (!/JSON|响应|缺少/.test(e.message || "")) throw e;  // 网络/鉴权类错误不重试
-      const text = await chat(messages, { ...o, jsonMode: true, temperature: Math.min(baseTemp + 0.2, 1) });
+      const text = await localChat(messages, { ...o, jsonMode: true, temperature: Math.min(baseTemp + 0.2, 1) });
       return extractJson(text);
     }
+  }
+
+  // ---------- generateJson（网关优先 → fetch 回退） ----------
+  async function generateJson(messages, opts) {
+    var c = caLlm();
+    if (c && typeof c.generateJson === "function" && caReady()) {
+      return c.generateJson(messages, mapOpts(opts));   // 委托：CA.llm 内置同样的解析失败重试
+    }
+    return localGenerateJson(messages, opts);
   }
 
   // ---------- 连接自检 ----------

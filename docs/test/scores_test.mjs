@@ -115,8 +115,10 @@ function ok(name, cond, extra) {
 function close(a, b, eps) { return Math.abs(a - b) < (eps == null ? 1e-9 : eps); }
 const tick = (ms) => new Promise((r) => setTimeout(r, ms == null ? 10 : ms));
 
-// ---------------- mock 数据层 ----------------
+// ---------------- mock 数据层（异步：方法返回 Promise） ----------------
 let uid = 0;
+let role = "admin";                 // admin | student（驱动 RLS 模拟：学生只读本人成绩）
+const STUDENT_MEMBER_ID = "m1";     // 张天宇在名单中的 id
 const db = {
   users: [],
   subjects: [
@@ -159,31 +161,43 @@ function resetScores() {
 }
 resetScores();
 
+function copyArr(a) { return (a || []).map((x) => Object.assign({}, x)); }
+// RLS 模拟：学生只能读到本人成绩；管理员读到全部
+function visibleScores() {
+  return role === "student"
+    ? (db.scores || []).filter((s) => s.memberId === STUDENT_MEMBER_ID)
+    : (db.scores || []);
+}
 CA.store = {
-  get(coll) { return (db[coll] || []).map((x) => Object.assign({}, x)); },
-  query(coll, fn) { return (db[coll] || []).filter(fn).map((x) => Object.assign({}, x)); },
-  find(coll, id) { const x = (db[coll] || []).find((i) => i.id === id); return x ? Object.assign({}, x) : null; },
-  add(coll, obj) { const o = Object.assign({ id: "gen_" + (++uid), createdAt: "t" }, obj); (db[coll] = db[coll] || []).push(o); return o; },
-  update(coll, id, patch) { const x = (db[coll] || []).find((i) => i.id === id); if (!x) return null; Object.assign(x, patch); return Object.assign({}, x); },
-  remove(coll, id) { const i = (db[coll] || []).findIndex((x) => x.id === id); if (i < 0) return false; db[coll].splice(i, 1); return true; },
+  get(coll) {
+    if (coll === "scores") return Promise.resolve(copyArr(visibleScores()));
+    return Promise.resolve(copyArr(db[coll] || []));
+  },
+  query(coll, fn) {
+    if (coll === "scores") return Promise.resolve(visibleScores().filter(fn).map((x) => Object.assign({}, x)));
+    return Promise.resolve((db[coll] || []).filter(fn).map((x) => Object.assign({}, x)));
+  },
+  find(coll, id) { const x = (db[coll] || []).find((i) => i.id === id); return Promise.resolve(x ? Object.assign({}, x) : null); },
+  add(coll, obj) { const o = Object.assign({ id: "gen_" + (++uid), createdAt: "t" }, obj); (db[coll] = db[coll] || []).push(o); return Promise.resolve(Object.assign({}, o)); },
+  update(coll, id, patch) { const x = (db[coll] || []).find((i) => i.id === id); if (!x) return Promise.resolve(null); Object.assign(x, patch); return Promise.resolve(Object.assign({}, x)); },
+  remove(coll, id) { const i = (db[coll] || []).findIndex((x) => x.id === id); if (i < 0) return Promise.resolve(false); db[coll].splice(i, 1); return Promise.resolve(true); },
   uid(prefix) { return (prefix || "id") + "_" + (++uid).toString(36); },
   memberName(id) { const m = (db.members || []).find((x) => x.id === id); return m ? m.name : ""; },
   settings() { return { aiEnabled: true }; },
   setSettings() {},
-  init() {},
+  init() { return Promise.resolve(true); },
 };
 
-let role = "admin";
 CA.auth = {
   current() {
-    return role === "student"
-      ? { id: "u_stu", name: "张天宇", role: "student", studentNo: "20230301" }
-      : { id: "u_t", name: "王老师", role: "admin", title: "班主任" };
+    return Promise.resolve(role === "student"
+      ? { id: "u_stu", uid: "u_stu", name: "张天宇", role: "student", studentNo: "20230301", memberId: STUDENT_MEMBER_ID }
+      : { id: "u_t", uid: "u_t", name: "王老师", role: "admin", title: "班主任", memberId: null });
   },
   isAdmin() { return role !== "student"; },
   isSuperAdmin() { return false; },
   can() { return role !== "student"; },
-  list() { return []; },
+  list() { return Promise.resolve([]); },
   switchTo() {},
 };
 
@@ -193,6 +207,8 @@ CA.ai = {
   enabled() { return aiOn; },
   analyzeExam(examId) { aiCalls.push(["report", examId]); return Promise.resolve({ markdown: "## 班级分析\n**总体**表现稳定\n- 数学整体偏难\n- 英语优秀率较高", stats: {} }); },
   studentComment(memberId, examId) { aiCalls.push(["comment", memberId, examId]); return Promise.resolve("该生学习态度端正，成绩稳步提升，建议保持错题复盘。"); },
+  diagnoseScores(examId) { aiCalls.push(["diagnose", examId]); return Promise.resolve({ markdown: "## 个人成绩诊断\n**优势**：语文稳定\n- 数学是薄弱环节，需加强错题复盘", stats: {}, warnings: [] }); },
+  studyPlan(examId) { aiCalls.push(["plan", examId]); return Promise.resolve({ markdown: "## 我的复习计划\n**目标**：两周内补齐数学短板\n- **数学**：每天整理 3 道错题\n- **物理**：回归课本例题", warnings: [] }); },
 };
 
 const toasts = [];
@@ -236,7 +252,7 @@ ok("percentileOf 空=0", S.percentileOf(1, []) === 0);
 // ============================================================
 console.log("\n[2] subjectStats（依赖 mock store）");
 // ============================================================
-const ss = S.subjectStats("e3");
+const ss = await S.subjectStats("e3");
 ok("subjectStats 返回 5 科", ss.length === 5);
 const cn = ss.find((x) => x.subjectId === "sub_cn");
 ok("subjectStats 语文均分", close(cn.mean, (140 + 110 + 95) / 3), cn.mean);
@@ -294,9 +310,9 @@ ok("降级 subjectCompare 不抛错", !fErr, fErr && fErr.message);
 ok("降级 subjectCompare 渲染（.bar-chart）", fel3.innerHTML.indexOf("bar-chart") >= 0);
 
 // ============================================================
-console.log("\n[4] parseImport（正常/异常/重复）");
+console.log("\n[4] parseImport / applyImport（正常/异常/重复，异步）");
 // ============================================================
-const parsed = CA.scores.parseImport([
+const parsedText = [
   "20230301,数学,138",        // ok 学号
   "陈嘉怡 语文 129",            // ok 姓名 + 空格
   "20230303，英语，90",         // ok 全角逗号
@@ -308,21 +324,29 @@ const parsed = CA.scores.parseImport([
   "",                          // 空行跳过
   "20230302,数学,120",          // ok
   "20230302,数学,121",          // fail 重复行
-].join("\n"));
+].join("\n");
+
+// 纯函数（同步，显式传入名单/科目）
+const pure = CA.scores.parseImportText(parsedText, db.members, db.subjects);
+ok("parseImportText 为同步纯函数", pure && typeof pure.okCount === "number" && typeof pure.then !== "function");
+
+// 异步包装（await store.get）
+const parsed = await CA.scores.parseImport(parsedText);
+ok("parseImport 返回 Promise", typeof CA.scores.parseImport(parsedText).then === "function");
 ok("parseImport okCount=4", parsed.okCount === 4, parsed.okCount);
 ok("parseImport failCount=6", parsed.failCount === 6, parsed.failCount + " :: " + JSON.stringify(parsed.rows.filter((r) => !r.ok).map((r) => r.reason)));
 const firstOk = parsed.rows.find((r) => r.ok);
 ok("parseImport 解析出 memberId/subjectId", firstOk.memberId === "m1" && firstOk.subjectId === "sub_ma", JSON.stringify(firstOk));
 
-// --- applyImport ---
+// --- applyImport（异步写库） ---
 resetScores();
-const p2 = CA.scores.parseImport("20230301,数学,150\n20230302,语文,88");
-const r2 = CA.scores.applyImport(p2, "e3");
+const p2 = await CA.scores.parseImport("20230301,数学,150\n20230302,语文,88");
+const r2 = await CA.scores.applyImport(p2, "e3");
 ok("applyImport 命中已有记录为更新", r2.updated === 2 && r2.added === 0, JSON.stringify(r2));
 const rec = db.scores.find((s) => s.memberId === "m1" && s.subjectId === "sub_ma" && s.examId === "e3");
 ok("applyImport 更新数值", rec && rec.score === 150, rec && rec.score);
-const p3 = CA.scores.parseImport("20230301,英语,77"); // e1 无英语记录
-const r3 = CA.scores.applyImport(p3, "e1");
+const p3 = await CA.scores.parseImport("20230301,英语,77"); // e1 无英语记录
+const r3 = await CA.scores.applyImport(p3, "e1");
 ok("applyImport 无记录为新增", r3.added === 1 && r3.updated === 0, JSON.stringify(r3));
 
 // ============================================================
@@ -336,7 +360,7 @@ role = "admin";
 aiOn = true;
 const root = new FakeEl("section");
 let mErr = null;
-try { CA.views.scores.mount(root); } catch (e) { mErr = e; }
+try { await CA.views.scores.mount(root); } catch (e) { mErr = e; }
 ok("admin mount 不抛错", !mErr, mErr && mErr.stack);
 [
   "exam-select", "score-subject-filter", "score-table",
@@ -344,6 +368,7 @@ ok("admin mount 不抛错", !mErr, mErr && mErr.stack);
   "chart-dist", "chart-trend", "chart-subject",
   "btn-ai-report", "ai-report-box", "btn-ai-comment", "ai-comment-box",
 ].forEach((id) => ok("admin 存在 #" + id, !!root.querySelector("#" + id)));
+ok("管理员视图标记 .admin-only", !!root.querySelector(".admin-only"));
 
 // AI 班级报告
 root.querySelector("#btn-ai-report").dispatch("click");
@@ -352,12 +377,13 @@ const reportBox = root.querySelector("#ai-report-box");
 ok("AI 报告渲染 markdown", reportBox.innerHTML.indexOf("<h3>") >= 0 && reportBox.innerHTML.indexOf("<strong>") >= 0, reportBox.innerHTML.slice(0, 90));
 ok("AI 报告调用 analyzeExam", aiCalls.some((c) => c[0] === "report" && c[1] === "e3"));
 
-// 批量导入流程
+// 批量导入流程（异步写库 + await）
 const importInput = root.querySelector("#score-import-input");
 importInput.value = "20230301,数学,150\nBAD LINE\n20230399,数学,100";
 root.querySelector("#btn-score-parse").dispatch("click");
 ok("解析后确认按钮可用", root.querySelector("#btn-score-confirm").hidden === false);
 root.querySelector("#btn-score-confirm").dispatch("click");
+await tick(40);
 const rec2 = db.scores.find((s) => s.memberId === "m1" && s.subjectId === "sub_ma" && s.examId === "e3");
 ok("导入写库成功", rec2 && rec2.score === 150, rec2 && rec2.score);
 ok("导入后 toast 汇报", toasts.some((t) => t.msg.indexOf("导入完成") >= 0));
@@ -366,22 +392,51 @@ ok("导入后 toast 汇报", toasts.some((t) => t.msg.indexOf("导入完成") >=
 aiOn = false;
 const root2 = new FakeEl("section");
 let e2 = null;
-try { CA.views.scores.mount(root2); } catch (e) { e2 = e; }
+try { await CA.views.scores.mount(root2); } catch (e) { e2 = e; }
 ok("AI 关闭 mount 不抛错", !e2, e2 && e2.message);
 ok("AI 关闭隐藏报告按钮", root2.querySelector("#btn-ai-report").hidden === true);
 ok("AI 关闭隐藏评语按钮", root2.querySelector("#btn-ai-comment").hidden === true);
 
-// --- 学生视角 ---
+// --- 学生视角（RLS：store.get("scores") 只返回本人） ---
 role = "student";
 aiOn = true;
+resetScores();
 const root3 = new FakeEl("section");
 let e3 = null;
-try { CA.views.scores.mount(root3); } catch (e) { e3 = e; }
+try { await CA.views.scores.mount(root3); } catch (e) { e3 = e; }
 ok("学生 mount 不抛错", !e3, e3 && e3.stack);
 ok("学生面板 #student-score-panel 存在", !!root3.querySelector("#student-score-panel"));
+ok("学生视图标记 .student-only", !!root3.querySelector(".student-only"));
 ok("学生不渲染成绩表 #score-table", root3.querySelector("#score-table") === null);
 ok("学生仍有考试选择", !!root3.querySelector("#exam-select"));
 ok("学生不暴露班级成员选择提示", root3.querySelector("#score-selected-hint") === null);
+
+// --- 学生端 AI：我的成绩诊断 / AI 学习计划 ---
+ok("学生端存在 #btn-ai-diagnose", !!root3.querySelector("#btn-ai-diagnose"));
+ok("学生端存在 #ai-diagnose-box", !!root3.querySelector("#ai-diagnose-box"));
+ok("学生端存在 #btn-ai-plan", !!root3.querySelector("#btn-ai-plan"));
+ok("学生端存在 #ai-plan-box", !!root3.querySelector("#ai-plan-box"));
+ok("学生端 AI 入口默认可用", root3.querySelector("#btn-ai-diagnose").disabled === false && root3.querySelector("#btn-ai-plan").disabled === false);
+root3.querySelector("#btn-ai-diagnose").dispatch("click");
+await tick(30);
+const diagBox = root3.querySelector("#ai-diagnose-box");
+ok("成绩诊断渲染 markdown", diagBox.innerHTML.indexOf("<h3>") >= 0 && diagBox.innerHTML.indexOf("<strong>") >= 0, diagBox.innerHTML.slice(0, 80));
+ok("成绩诊断调用 diagnoseScores(e3)", aiCalls.some((c) => c[0] === "diagnose" && c[1] === "e3"));
+root3.querySelector("#btn-ai-plan").dispatch("click");
+await tick(30);
+const planBox = root3.querySelector("#ai-plan-box");
+ok("学习计划渲染 markdown", planBox.innerHTML.indexOf("<h3>") >= 0, planBox.innerHTML.slice(0, 80));
+ok("学习计划调用 studyPlan(e3)", aiCalls.some((c) => c[0] === "plan" && c[1] === "e3"));
+
+// --- 学生端 AI 关闭：入口隐藏 ---
+aiOn = false;
+const root4 = new FakeEl("section");
+let e4 = null;
+try { await CA.views.scores.mount(root4); } catch (e) { e4 = e; }
+ok("学生端 AI 关闭 mount 不抛错", !e4, e4 && e4.message);
+ok("学生端 AI 关闭隐藏诊断入口", root4.querySelector("#btn-ai-diagnose").hidden === true);
+ok("学生端 AI 关闭隐藏计划入口", root4.querySelector("#btn-ai-plan").hidden === true);
+aiOn = true;
 
 // --- unmount ---
 let uErr = null;

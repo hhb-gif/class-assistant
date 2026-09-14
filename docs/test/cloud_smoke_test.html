@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>云端冒烟测试 · 班级管家</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 24px; color: #1f2937; background: #f5f7fa; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p.hint { color: #6b7280; margin: 0 0 16px; font-size: 13px; }
+    ol { background: #fff; border-radius: 12px; padding: 16px 16px 16px 36px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+    li { margin: 6px 0; line-height: 1.5; }
+    .ok { color: #15803d; font-weight: 600; }
+    .fail { color: #b91c1c; font-weight: 600; }
+    .muted { color: #6b7280; word-break: break-all; }
+    code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>CloudBase 云端冒烟测试</h1>
+  <p class="hint">用途：部署到<strong>静态托管域名</strong>后，验证 CORS / 认证 / RLS 是否打通（本地 localhost 未进安全域名白名单，多半会被 CORS 拦）。本页只读，不写入任何数据。</p>
+  <ol id="log"></ol>
+
+  <!-- 1) CDN 全量 SDK（含 app.rdb() / app.auth），固定版本 3.9.3 -->
+  <script src="https://static.cloudbase.net/cloudbase-js-sdk/3.9.3/cloudbase.full.js"></script>
+  <!-- 2) 前端公开配置（envId + publishableKey） -->
+  <script src="../src/config.js"></script>
+  <!-- 3) 云端单例封装 -->
+  <script src="../src/cloud.js"></script>
+
+  <script>
+    (function () {
+      var log = document.getElementById("log");
+
+      function line(name, ok, detail) {
+        var li = document.createElement("li");
+        var mark = ok ? "✅" : "❌";
+        var cls = ok ? "ok" : "fail";
+        li.innerHTML = "<span class=\"" + cls + "\">" + mark + "</span> <code>" + name +
+          "</code> <span class=\"muted\">" + (detail == null ? "" : String(detail)) + "</span>";
+        log.appendChild(li);
+      }
+
+      // 步骤 1：SDK 是否加载
+      var sdkOk = typeof window.cloudbase !== "undefined" && typeof window.cloudbase.init === "function";
+      line("SDK 加载（window.cloudbase.init）", sdkOk, sdkOk ? "已被 CDN 加载" : "未加载：CDN 失败/被拦截/版本 404");
+
+      // 步骤 2：cloud.js 是否就绪（含 config 校验）
+      var cloudReady = !!(window.CA && CA.cloud && CA.cloud.ready && CA.cloud.ready());
+      var cloudErr = (window.CA && CA.cloud && CA.cloud.lastError) ? CA.cloud.lastError() : null;
+      line("CA.cloud.ready()", cloudReady, cloudReady ? "已就绪" : ("未就绪：" + (cloudErr ? cloudErr.message : "未知")));
+
+      if (!cloudReady) {
+        line("后续步骤", false, "SDK/配置未就绪，已跳过 getSession 与 notices 查询");
+        return;
+      }
+
+      // 步骤 3：登录会话（未登录 session 为 null 也属正常）
+      CA.cloud.auth.getSession().then(function (res) {
+        var s = res && res.data ? res.data.session : null;
+        if (res && res.error && !s) {
+          line("auth.getSession()", false, res.error.message || JSON.stringify(res.error));
+        } else if (s) {
+          line("auth.getSession()", true, "已登录 uid=" + (s.user && s.user.id ? s.user.id : "(无)"));
+        } else {
+          line("auth.getSession()", true, "未登录（session = null）");
+        }
+      }).catch(function (e) {
+        line("auth.getSession()", false, (e && e.message) || e);
+      });
+
+      // 步骤 4：读 notices（验证 CORS + 认证 + RLS 三者是否打通）
+      CA.cloud.db.from("notices").select("*").then(function (res) {
+        if (res && res.error) {
+          line("db.from('notices').select('*')", false, res.error.message || JSON.stringify(res.error));
+          return;
+        }
+        var data = res && res.data;
+        var n = Array.isArray(data) ? data.length : (data == null ? 0 : 1);
+        line("db.from('notices').select('*')", true, "返回 " + n + " 行");
+      }).catch(function (e) {
+        line("db.from('notices').select('*')", false, (e && e.message) || e);
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,4 +1,10 @@
 <!DOCTYPE html>
+<!--
+  ⚠️ 已失效（P1 异步化 + 登录门后），待 P1 收尾重写 ⚠️
+  本用例仍按「假身份下拉切换角色」的旧模型编写：直接操作 #role-switcher <select> 并同步调用
+  CA.store / CA.auth，与现状（真实登录会话 + 数据层返回 Promise + 登录门）不符，运行必失败。
+  —— 请勿参照本文件；集成验证请以修复后的 docs/src/app.js 行为为准。
+-->
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -6,6 +12,10 @@
   <link rel="stylesheet" href="../styles.css">
 </head>
 <body>
+  <!-- ⚠️ 已失效：P1 异步化 + 登录门后本用例不再适用，待 P1 收尾重写（勿参照） -->
+  <div style="background:#b91c1c;color:#fff;padding:10px 14px;font-weight:700;line-height:1.5">
+    ⚠️ 本测试已失效（P1 异步化 + 登录门后），待 P1 收尾重写 —— 结果不可信，请勿参照。
+  </div>
   <!-- 复刻 index.html 骨架（id 与契约一致） -->
   <header id="topbar">
     <div id="brand">冒烟测试<span id="brand-sub">集成验证</span></div>

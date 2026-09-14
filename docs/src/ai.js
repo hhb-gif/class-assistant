@@ -117,20 +117,23 @@ CA.ai = (function () {
     };
   }
 
-  function totalsOf(examId) {
+  // 按成员汇总总分（纯函数：显式传入 scores，避免重复读库）
+  function totalsOf(scores, examId) {
     var byMember = {};
-    CA.store.get("scores").forEach(function (s) {
+    (scores || []).forEach(function (s) {
       if (s.examId !== examId) return;
       byMember[s.memberId] = (byMember[s.memberId] || 0) + (s.score || 0);
     });
     return byMember; // { memberId: 总分 }
   }
 
-  function examStats(examId) {
-    var exam = CA.store.find("exams", examId);
+  // 异步：先读 exams/subjects/scores/members（CA.store 返回 Promise），再本地计算
+  async function examStats(examId) {
+    var exam = await CA.store.find("exams", examId);
     if (!exam) return null;
-    var subjects = CA.store.get("subjects").sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
-    var all = CA.store.get("scores").filter(function (s) { return s.examId === examId; });
+    var subjects = (await CA.store.get("subjects")).sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
+    var all = (await CA.store.get("scores")).filter(function (s) { return s.examId === examId; });
+    var members = await CA.store.get("members"); // 预载成员缓存，供下方 memberName 同步读取
     var fullTotal = subjects.reduce(function (t, s) { return t + (s.fullScore || 0); }, 0);
 
     var subStats = subjects.map(function (sub) {
@@ -138,7 +141,7 @@ CA.ai = (function () {
       return statOf(sub.name, sub.fullScore, vals);
     });
 
-    var byMember = totalsOf(examId);
+    var byMember = totalsOf(all, examId);
     var totals = Object.keys(byMember).map(function (mid) {
       return { memberId: mid, name: CA.store.memberName(mid), total: f1(byMember[mid]) };
     }).sort(function (a, b) { return b.total - a.total; });
@@ -146,7 +149,7 @@ CA.ai = (function () {
     var totalVals = totals.map(function (t) { return t.total; });
     return {
       exam: { id: exam.id, name: exam.name, date: exam.date },
-      count: CA.store.get("members").length,
+      count: members.length,
       fullTotal: fullTotal,
       subjects: subStats,
       totals: totals,
@@ -154,17 +157,19 @@ CA.ai = (function () {
     };
   }
 
-  function sortedExams() {
-    return CA.store.get("exams").slice().sort(function (a, b) { return String(a.date).localeCompare(String(b.date)); });
+  // 纯函数：按日期升序排列考试（显式传入 exams）
+  function sortedExams(exams) {
+    return (exams || []).slice().sort(function (a, b) { return String(a.date).localeCompare(String(b.date)); });
   }
 
-  // 与上一场考试的总分变化（用于进步/退步判断）
-  function improvementList(examId) {
-    var exams = sortedExams();
+  // 与上一场考试的总分变化（用于进步/退步判断）；异步读库
+  async function improvementList(examId) {
+    var exams = sortedExams(await CA.store.get("exams"));
     var idx = -1;
     for (var i = 0; i < exams.length; i++) if (exams[i].id === examId) idx = i;
     if (idx <= 0) return [];
-    var cur = totalsOf(examId), prev = totalsOf(exams[idx - 1].id);
+    var scores = await CA.store.get("scores");
+    var cur = totalsOf(scores, examId), prev = totalsOf(scores, exams[idx - 1].id);
     var out = [];
     Object.keys(cur).forEach(function (mid) {
       if (prev[mid] == null) return;
@@ -241,11 +246,12 @@ CA.ai = (function () {
 
   async function analyzeExam(examId) {
     if (!enabled()) throw new Error("AI 助手未开启");
-    var stats = examStats(examId);
+    var stats = await examStats(examId);
     if (!stats) throw new Error("考试不存在");
+    var imp = await improvementList(examId);
     var obj = await CA.llm.generateJson([
       { role: "system", content: reportSystemPrompt() },
-      { role: "user", content: statsToPrompt(stats, improvementList(examId)) }
+      { role: "user", content: statsToPrompt(stats, imp) }
     ], { temperature: 0.4, timeoutMs: 120000 });
     return { markdown: reportToMarkdown(obj, stats), stats: stats };
   }
@@ -253,13 +259,13 @@ CA.ai = (function () {
   // ========== 4) AI 个人评语 ==========
   async function studentComment(memberId, examId) {
     if (!enabled()) throw new Error("AI 助手未开启");
-    var stats = examStats(examId);
+    var stats = await examStats(examId);
     if (!stats) throw new Error("考试不存在");
-    var member = CA.store.find("members", memberId);
+    var member = await CA.store.find("members", memberId);
     if (!member) throw new Error("学生不存在");
 
-    var subjects = CA.store.get("subjects").sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
-    var mine = CA.store.get("scores").filter(function (s) { return s.examId === examId && s.memberId === memberId; });
+    var subjects = (await CA.store.get("subjects")).sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
+    var mine = (await CA.store.get("scores")).filter(function (s) { return s.examId === examId && s.memberId === memberId; });
     var subStats = {};
     stats.subjects.forEach(function (s) { subStats[s.name] = s; });
 
@@ -289,13 +295,14 @@ CA.ai = (function () {
   }
 
   // ========== 5) 收集结果统计与 AI 归类汇总（M3） ==========
-  function surveyStats(surveyId) {
-    var survey = CA.store.find("surveys", surveyId);
+  // 异步：先读 surveys/responses/members（CA.store 返回 Promise），再本地统计
+  async function surveyStats(surveyId) {
+    var survey = await CA.store.find("surveys", surveyId);
     if (!survey) return null;
-    var responses = CA.store.get("responses").filter(function (r) { return r.surveyId === surveyId; });
+    var responses = (await CA.store.get("responses")).filter(function (r) { return r.surveyId === surveyId; });
     var answered = {};
     responses.forEach(function (r) { answered[r.memberId] = true; });
-    var members = CA.store.get("members");
+    var members = await CA.store.get("members");
 
     var questions = (survey.questions || []).map(function (q) {
       var counts = {}, texts = [];
@@ -349,7 +356,7 @@ CA.ai = (function () {
 
   async function summarizeResponses(surveyId) {
     if (!enabled()) throw new Error("AI 助手未开启");
-    var stats = surveyStats(surveyId);
+    var stats = await surveyStats(surveyId);
     if (!stats) throw new Error("收集表不存在");
     if (!stats.submitted) throw new Error("暂无提交，无法汇总");
 
@@ -381,6 +388,301 @@ CA.ai = (function () {
     return { markdown: surveyToMarkdown(obj, stats), stats: stats };
   }
 
+  // ========== 6) 学生端：通知/资料要点提炼 ==========
+  // 字段白名单清洗：字符串数组去空、去重、限长、限条数
+  function cleanList(raw, maxItems, maxLen) {
+    var out = [];
+    var arr = Array.isArray(raw) ? raw : (raw == null ? [] : [raw]);
+    for (var i = 0; i < arr.length && out.length < maxItems; i++) {
+      var s = trimTo(arr[i], maxLen);
+      if (s && out.indexOf(s) < 0) out.push(s);
+    }
+    return out;
+  }
+
+  // 通知正文 → 给 LLM 的纯文本（限制总长，控制 token）
+  function noticeTextOf(n) {
+    var parts = ["标题：" + (n.title || "")];
+    if (n.category) parts.push("分类：" + n.category);
+    if (n.timeLabel && n.deadline) parts.push(n.timeLabel + "：" + n.deadline + (n.endTime ? " ~ " + n.endTime : ""));
+    if (n.location) parts.push("地点：" + n.location);
+    if (n.course) parts.push("科目：" + n.course);
+    if (n.content) parts.push("正文：\n" + n.content);
+    return trimTo(parts.join("\n"), 1500);
+  }
+
+  // 严格结构校验：points 必须有，keywords 可空（空则记 warning）
+  function sanitizeSummary(raw) {
+    var warnings = [];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    var points = cleanList(raw.points, 6, 80);
+    var keywords = cleanList(raw.keywords, 6, 12);
+    if (!points.length) return null;                       // 无要点视为无效输出，交由上层抛错
+    if (points.length < 3) warn(warnings, "AI 返回的要点不足 3 条");
+    if (!keywords.length) warn(warnings, "AI 未返回关键词");
+    if (Array.isArray(raw.warnings)) raw.warnings.slice(0, 5).forEach(function (w) { warn(warnings, w); });
+    return { points: points, keywords: keywords, warnings: warnings };
+  }
+
+  async function summarizeNotice(noticeId) {
+    if (!enabled()) throw new Error("AI 助手未开启");
+    if (!noticeId) throw new Error("缺少通知 id");
+    var n = await CA.store.find("notices", noticeId);
+    if (!n) throw new Error("通知不存在");
+    var obj = await CA.llm.generateJson([
+      { role: "system", content: [
+        "你是班级资料提炼助手，帮学生快速抓住通知/资料的重点。",
+        "只依据给定内容提炼，不要编造未出现的时间、地点或要求。",
+        "只返回 JSON，不要 markdown，不要代码块，不要解释。",
+        '返回示例：{"points":["要点 10~60 字"],"keywords":["关键词 2~8 字"]}',
+        "points 提炼 3~6 条并按重要性排序；keywords 2~6 个，是便于检索的名词。"
+      ].join("\n") },
+      { role: "user", content: noticeTextOf(n) }
+    ], { temperature: 0.2, timeoutMs: 60000 });
+    var out = sanitizeSummary(obj);
+    if (!out) throw new Error("AI 返回格式异常，请重试");
+    return out;
+  }
+
+  // ========== 7) 学生端：学习问答（基于给定上下文） ==========
+  // history 仅保留最近 4 条 user/assistant 消息，单条 ≤ 500 字
+  function sanitizeHistory(history) {
+    var out = [];
+    if (!Array.isArray(history)) return out;
+    history.slice(-6).forEach(function (m) {
+      if (!m || typeof m !== "object") return;
+      var role = m.role === "assistant" ? "assistant" : (m.role === "user" ? "user" : null);
+      var content = trimTo(m.content, 500);
+      if (role && content) out.push({ role: role, content: content });
+    });
+    return out.slice(-4);
+  }
+
+  async function askAbout(input) {
+    if (!enabled()) throw new Error("AI 助手未开启");
+    var o = input || {};
+    var context = trimTo(o.context, 2000);
+    var question = trimTo(o.question, 200);
+    if (!context) throw new Error("缺少参考资料（通知正文/资料片段）");
+    if (!question) throw new Error("请先输入你的问题");
+    var messages = [{ role: "system", content: [
+      "你是班级学习助理。只依据【参考资料】回答学生的问题，做答疑与讲解。",
+      "资料里没有的信息不要编造；确实无法回答时，建议学生查看原文或请教老师。",
+      "用口语化、鼓励的语气，回答不超过 200 字，不要 markdown 标题和代码块。"
+    ].join("\n") }]
+      .concat(sanitizeHistory(o.history))
+      .concat([{ role: "user", content: "【参考资料】\n" + context + "\n\n【学生问题】\n" + question }]);
+    var text = await CA.llm.chat(messages, { temperature: 0.4, timeoutMs: 60000 });
+    var out = String(text == null ? "" : text).trim();
+    if (!out) throw new Error("AI 返回内容为空，请重试");
+    return out.length > 400 ? out.slice(0, 400) : out;
+  }
+
+  // ========== 8) 学生端：个人成绩诊断 ==========
+  // 解析当前学生对应的名单 id：优先 auth 归一化的 memberId，退化按学号/姓名匹配
+  // （与 scores.js/collect.js 口径一致；不写客户端权限过滤）
+  async function resolveMyMemberId() {
+    var me = null;
+    try {
+      if (window.CA && CA.auth && typeof CA.auth.current === "function") me = await CA.auth.current();
+    } catch (e) { me = null; }
+    if (!me) throw new Error("请先登录后再使用该功能");
+    if (me.memberId) return { memberId: me.memberId, name: me.name || "" };
+    var members = await CA.store.get("members");
+    var i;
+    if (me.studentNo) {
+      for (i = 0; i < members.length; i++) {
+        if (String(members[i].studentNo) === String(me.studentNo)) return { memberId: members[i].id, name: members[i].name || me.name || "" };
+      }
+    }
+    if (me.name) {
+      for (i = 0; i < members.length; i++) {
+        if (members[i].name === me.name) return { memberId: members[i].id, name: members[i].name };
+      }
+    }
+    throw new Error("当前账号未绑定学生名单，无法生成个人成绩报告");
+  }
+
+  // 当前学生本次考试的个人成绩统计。
+  // 说明：学生角色下 scores 查询受服务端 RLS 限制、只返回本人记录；此处仅按 examId 圈定考试，
+  //       不再按 memberId 过滤——客户端过滤不能充当权限边界。
+  async function myExamStats(examId) {
+    var who = await resolveMyMemberId();
+    var exam = await CA.store.find("exams", examId);
+    if (!exam) throw new Error("考试不存在");
+    var subjects = (await CA.store.get("subjects")).sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
+    var rows = await CA.store.get("scores");
+    var bySubject = {};
+    (rows || []).forEach(function (s) {
+      if (s.examId === examId && bySubject[s.subjectId] == null) bySubject[s.subjectId] = s.score;
+    });
+    var items = subjects.map(function (sub) {
+      var score = bySubject[sub.id] != null ? Number(bySubject[sub.id]) : null;
+      var full = Number(sub.fullScore) || 100;
+      return { name: sub.name, score: score, fullScore: full, rate: score == null ? null : f1(score / full * 100) };
+    });
+    var scored = items.filter(function (it) { return it.score != null; });
+    var got = scored.reduce(function (t, it) { return t + it.score; }, 0);
+    var full = scored.reduce(function (t, it) { return t + it.fullScore; }, 0);
+    var ranked = scored.slice().sort(function (a, b) { return a.rate - b.rate; });
+    var weak = ranked.slice(0, 3).map(function (it) { return it.name; });
+    var strong = ranked.slice().reverse().filter(function (it) { return it.rate >= 85; }).slice(0, 2).map(function (it) { return it.name; });
+    return {
+      exam: { id: exam.id, name: exam.name, date: exam.date },
+      student: who,
+      subjects: items,
+      weak: weak,
+      strong: strong,
+      total: { score: f1(got), fullScore: full, rate: f1(full ? got / full * 100 : 0) }
+    };
+  }
+
+  function myStatsToPrompt(stats) {
+    var lines = ["考试：" + stats.exam.name + "（" + stats.exam.date + "）", "学生：" + (stats.student.name || "本人")];
+    lines.push("各科得分（得分率）：");
+    stats.subjects.forEach(function (it) {
+      lines.push("- " + it.name + "：" + (it.score == null ? "缺考/未录入" : it.score + "/" + it.fullScore + "（" + it.rate + "%）"));
+    });
+    lines.push("总得分：" + stats.total.score + "/" + stats.total.fullScore + "（" + stats.total.rate + "%）");
+    if (stats.weak.length) lines.push("相对薄弱：" + stats.weak.join("、"));
+    if (stats.strong.length) lines.push("相对优势：" + stats.strong.join("、"));
+    return lines.join("\n");
+  }
+
+  // markdown 软截断：优先在行边界断开，保证 ≤ max 字
+  function clipMarkdown(md, max) {
+    var s = String(md == null ? "" : md).trim();
+    if (s.length <= max) return s;
+    var cut = s.slice(0, max);
+    var nl = cut.lastIndexOf("\n");
+    if (nl > max * 0.6) cut = cut.slice(0, nl);
+    return cut + "\n- …（内容较长，已截断）";
+  }
+
+  function diagnoseToMarkdown(obj, stats, warnings) {
+    var md = ["## " + stats.exam.name + " · 个人成绩诊断"];
+    if (obj && obj.overview) md.push(String(obj.overview).trim());
+    if (obj && obj.strengths && obj.strengths.length) { md.push("## 优势"); obj.strengths.forEach(function (s) { md.push("- " + s); }); }
+    if (obj && obj.weaknesses && obj.weaknesses.length) { md.push("## 薄弱环节"); obj.weaknesses.forEach(function (s) { md.push("- " + s); }); }
+    if (obj && obj.suggestions && obj.suggestions.length) { md.push("## 提分建议"); obj.suggestions.forEach(function (s) { md.push("- " + s); }); }
+    md.push("## 得分明细");
+    stats.subjects.forEach(function (it) {
+      md.push("- " + it.name + "：" + (it.score == null ? "缺考/未录入" : it.score + "/" + it.fullScore + "（" + it.rate + "%）"));
+    });
+    md.push("- 总得分：" + stats.total.score + "/" + stats.total.fullScore + "（" + stats.total.rate + "%）");
+    if (warnings && warnings.length) md.push("> 提示：" + warnings.join("；"));
+    return clipMarkdown(md.join("\n"), 600);
+  }
+
+  async function diagnoseScores(examId) {
+    if (!enabled()) throw new Error("AI 助手未开启");
+    var stats = await myExamStats(examId);
+    if (!stats.total.fullScore) throw new Error("本次考试暂无你的成绩");
+    var obj = await CA.llm.generateJson([
+      { role: "system", content: [
+        "你是中学学科辅导老师，为学生本人写一份成绩诊断。",
+        "只使用给定的本人成绩数据；不得编造分数、名次，也不要引用他人的成绩或排名。",
+        "先肯定优势，再指出薄弱，建议要具体可执行；语气鼓励。",
+        "只返回 JSON，不要 markdown，不要代码块，不要解释。",
+        '返回示例：{"overview":"总评 60~120 字","strengths":["优势 15~40 字"],"weaknesses":["薄弱点 15~40 字"],"suggestions":["提分建议 15~50 字"]}',
+        "strengths 1~3 条，weaknesses 1~3 条，suggestions 2~4 条。"
+      ].join("\n") },
+      { role: "user", content: myStatsToPrompt(stats) }
+    ], { temperature: 0.4, timeoutMs: 90000 });
+
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("AI 返回格式异常，请重试");
+    var clean = {
+      overview: trimTo(obj.overview, 300),
+      strengths: cleanList(obj.strengths, 3, 80),
+      weaknesses: cleanList(obj.weaknesses, 3, 80),
+      suggestions: cleanList(obj.suggestions, 4, 100)
+    };
+    if (!clean.overview && !clean.suggestions.length) throw new Error("AI 返回格式异常，请重试");
+    var warnings = [];
+    if (!clean.strengths.length) warn(warnings, "AI 未给出优势项");
+    if (Array.isArray(obj.warnings)) obj.warnings.slice(0, 5).forEach(function (w) { warn(warnings, w); });
+    return { markdown: diagnoseToMarkdown(clean, stats, warnings), stats: stats, warnings: warnings };
+  }
+
+  // ========== 9) 学生端：个人复习计划 ==========
+  function sanitizePlan(raw) {
+    var warnings = [];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    var plan = [];
+    if (Array.isArray(raw.plan)) {
+      raw.plan.slice(0, 3).forEach(function (p) {
+        if (!p || typeof p !== "object") return;
+        var subject = trimTo(p.subject, 20);
+        var tasks = cleanList(p.tasks, 3, 80);
+        if (subject && tasks.length) plan.push({ subject: subject, tasks: tasks });
+      });
+    }
+    if (!plan.length) return null;                          // 无分科安排即无效，交由上层抛错
+    var out = { goal: trimTo(raw.goal, 150), plan: plan, tips: cleanList(raw.tips, 3, 60) };
+    if (!out.goal) warn(warnings, "AI 未给出目标");
+    if (Array.isArray(raw.warnings)) raw.warnings.slice(0, 5).forEach(function (w) { warn(warnings, w); });
+    out.warnings = warnings;
+    return out;
+  }
+
+  function planToMarkdown(obj, stats, warnings) {
+    var md = ["## 我的复习计划"];
+    if (obj && obj.goal) md.push(String(obj.goal).trim());
+    if (obj && obj.plan && obj.plan.length) {
+      md.push("## 分科安排");
+      obj.plan.forEach(function (p) {
+        md.push("- **" + p.subject + "**");
+        (p.tasks || []).forEach(function (t) { md.push("- " + t); });
+      });
+    }
+    if (obj && obj.tips && obj.tips.length) { md.push("## 执行提醒"); obj.tips.forEach(function (t) { md.push("- " + t); }); }
+    if (warnings && warnings.length) md.push("> 提示：" + warnings.join("；"));
+    return clipMarkdown(md.join("\n"), 600);
+  }
+
+  async function studyPlan(examId) {
+    if (!enabled()) throw new Error("AI 助手未开启");
+    var stats = await myExamStats(examId);
+    if (!stats.total.fullScore) throw new Error("本次考试暂无你的成绩");
+    var obj = await CA.llm.generateJson([
+      { role: "system", content: [
+        "你是中学学习规划师，为一名学生制定 1~2 周内可执行的复习计划。",
+        "只针对给定数据里的薄弱科目；不要编造分数或他人情况。",
+        "只返回 JSON，不要 markdown，不要代码块，不要解释。",
+        '返回示例：{"goal":"目标 30~60 字","plan":[{"subject":"数学","tasks":["具体任务 15~40 字"]}],"tips":["提醒 10~30 字"]}',
+        "plan 覆盖 1~3 个薄弱科目，每科 2~3 条任务；tips 1~3 条。"
+      ].join("\n") },
+      { role: "user", content: myStatsToPrompt(stats) }
+    ], { temperature: 0.5, timeoutMs: 90000 });
+
+    var clean = sanitizePlan(obj);
+    if (!clean) throw new Error("AI 返回格式异常，请重试");
+    var warnings = clean.warnings.slice();
+    return { markdown: planToMarkdown(clean, stats, warnings), warnings: warnings };
+  }
+
+  // ========== 10) 学生端：开放题回答草稿 / 润色 ==========
+  async function composeAnswer(input) {
+    if (!enabled()) throw new Error("AI 助手未开启");
+    var o = input || {};
+    var question = trimTo(o.question, 200);
+    if (!question) throw new Error("缺少题目内容");
+    var hints = "";
+    if (Array.isArray(o.hints)) {
+      hints = trimTo(o.hints.map(function (h) { return trimTo(h, 100); }).filter(Boolean).join("；"), 500);
+    } else {
+      hints = trimTo(o.hints, 500);
+    }
+    var user = "【题目】\n" + question + (hints ? "\n\n【可用提示】\n" + hints : "") + "\n\n请直接给出回答草稿。";
+    var text = await CA.llm.chat([
+      { role: "system", content: "你是学生的写作帮手。根据【题目】和【可用提示】帮学生起草一段回答草稿：用第一人称、真诚自然、贴合学生口吻；不得编造提示之外的事实；控制在 200 字以内；只输出回答正文，不要标题、不要引号、不要 markdown。" },
+      { role: "user", content: user }
+    ], { temperature: 0.7, timeoutMs: 60000 });
+    var out = String(text == null ? "" : text).trim();
+    if (!out) throw new Error("AI 返回内容为空，请重试");
+    return out.length > 300 ? out.slice(0, 300) : out;
+  }
+
   return {
     enabled: enabled,
     info: info,
@@ -389,6 +691,12 @@ CA.ai = (function () {
     studentComment: studentComment,
     examStats: examStats,
     surveyStats: surveyStats,
-    summarizeResponses: summarizeResponses
+    summarizeResponses: summarizeResponses,
+    // 学生端新增（Wave 2b-2）
+    summarizeNotice: summarizeNotice,
+    askAbout: askAbout,
+    diagnoseScores: diagnoseScores,
+    studyPlan: studyPlan,
+    composeAnswer: composeAnswer
   };
 })();

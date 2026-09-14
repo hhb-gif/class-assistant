@@ -1,8 +1,8 @@
-// 信息收集模块自测（Agent F3 · M3）
+// 信息收集模块自测（P1b 异步迁移版）
 // 运行：node docs/test/collect_test.mjs（在 class-assistant 目录下）
-// 零依赖：自带极简 DOM 桩 + mock CA.store / CA.auth / CA.ai / CA.app / CA.icon / CA.util
+// 零依赖：自带极简 DOM 桩 + mock（异步）CA.store / CA.auth / CA.ai / CA.app / CA.icon / CA.util
 // 覆盖：列表按截止排序、创建字段完整、学生提交、重复提交为更新、统计票数/百分比、未提交名单、
-//       AI 汇总调用链、XSS 转义、权限（学生看不到新建/汇总）。
+//       AI 汇总调用链、XSS 转义、权限（学生看不到新建/汇总）、异步 loading/错误态。
 import path from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -82,6 +82,7 @@ class StubEl {
   }
   focus() { this._focused = true; }
   blur() {}
+  scrollIntoView() {}
   closest(sel) {
     let node = this;
     while (node) { if (matchesSimple(node, sel)) return node; node = node.parentNode; }
@@ -196,7 +197,7 @@ global.alert = () => {};
 global.CA = {};
 
 // ============================================================
-// 三、mock CA.store / auth / ai / app / icon / util
+// 三、mock CA.store / auth / ai / app / icon / util（全部异步，贴合 PG store）
 // ============================================================
 const clone = (x) => JSON.parse(JSON.stringify(x));
 
@@ -205,34 +206,34 @@ function makeStore(seed) {
   let counter = 0;
   return {
     _db: db,
-    get(c) { return clone(db[c] || []); },
+    get(c) { return Promise.resolve(clone(db[c] || [])); },
     find(c, id) {
-      for (const x of (db[c] || [])) if (x.id === id) return clone(x);
-      return null;
+      for (const x of (db[c] || [])) if (x.id === id) return Promise.resolve(clone(x));
+      return Promise.resolve(null);
     },
-    query(c, fn) { return (db[c] || []).filter(fn).map(clone); },
+    query(c, fn) { return Promise.resolve((db[c] || []).filter(fn).map(clone)); },
     add(c, obj) {
       const now = new Date().toISOString();
       const o = Object.assign({}, clone(obj), { id: clone(obj).id || ("new_" + (++counter)) });
       if (!o.createdAt) o.createdAt = now;
       o.updatedAt = now;
       (db[c] = db[c] || []).push(o);
-      return clone(o);
+      return Promise.resolve(clone(o));
     },
     update(c, id, patch) {
       for (const x of (db[c] || [])) {
-        if (x.id === id) { Object.assign(x, clone(patch), { updatedAt: new Date().toISOString() }); return clone(x); }
+        if (x.id === id) { Object.assign(x, clone(patch), { updatedAt: new Date().toISOString() }); return Promise.resolve(clone(x)); }
       }
-      return null;
+      return Promise.resolve(null);
     },
     remove(c, id) {
       const l = db[c] || [];
-      for (let i = 0; i < l.length; i++) if (l[i].id === id) { l.splice(i, 1); return true; }
-      return false;
+      for (let i = 0; i < l.length; i++) if (l[i].id === id) { l.splice(i, 1); return Promise.resolve(true); }
+      return Promise.resolve(false);
     },
     settings() { return clone(db.settings || {}); },
     setSettings(patch) { db.settings = Object.assign({}, db.settings, patch); },
-    reset() {},
+    reset() { return Promise.resolve(true); },
     uid(p) { return (p || "id") + "_test" + (++counter); },
     memberName(mid) {
       const m = (db.members || []).filter((x) => x.id === mid)[0];
@@ -248,9 +249,8 @@ const users = {
 };
 let currentId = "u_t";
 CA.auth = {
-  current() { return users[currentId]; },
-  switchTo(id) { currentId = id; },
-  list() { return [users.u_t, users.u_a, users.u_s]; },
+  current() { return Promise.resolve(clone(users[currentId])); },
+  list() { return Promise.resolve([users.u_t, users.u_a, users.u_s].map(clone)); },
   isAdmin() { const r = users[currentId].role; return r === "admin" || r === "superAdmin"; },
   isSuperAdmin() { return users[currentId].role === "superAdmin"; },
   can(action) {
@@ -265,16 +265,21 @@ let summaryCalls = [];
 let surveyStatsCalls = [];
 CA.ai = {
   enabled() { return aiOn; },
-  surveyStats(id) {
+  async surveyStats(id) {
     surveyStatsCalls.push(id);
-    const s = CA.store.find("surveys", id);
+    const s = await CA.store.find("surveys", id);
     if (!s) return null;
-    const base = CA.collect.computeStats(id);
+    const base = await CA.collect.computeStats(id);
     return { survey: s, total: base.total, submitted: base.submitted, missing: base.missing.slice(), questions: [] };
   },
   async summarizeResponses(id) {
     summaryCalls.push(id);
     return { markdown: "## 结论\n- **多数**支持周五下午\n- 有同学希望提前通知", stats: {} };
+  },
+  composeAnswerCalls: [],
+  async composeAnswer(input) {
+    this.composeAnswerCalls.push(input);
+    return "AI 生成草稿内容";
   },
 };
 
@@ -367,13 +372,18 @@ function ok(cond, msg) {
   else { failCount++; console.error("  ✗ " + msg); throw new Error("断言失败: " + msg); }
 }
 const tick = () => new Promise((r) => setTimeout(r, 0));
-const flush = async () => { await tick(); await tick(); await tick(); };
+// 异步渲染涉及多层 Promise，多轮 tick 确保全部落定
+const flush = async (n = 16) => { for (let i = 0; i < n; i++) await tick(); };
 
 const root = document.createElement("section");
 document.body.appendChild(root);
 
 function setUser(id) { currentId = id; }
-function remount() { if (CA.views.collect) CA.views.collect.unmount(); CA.views.collect.mount(root); }
+async function remount() {
+  if (CA.views.collect) CA.views.collect.unmount();
+  await CA.views.collect.mount(root);
+  await flush();
+}
 function rows() { return root.querySelectorAll("#collect-list .list-row"); }
 function rowIds() { return rows().map((r) => r.dataset.surveyId); }
 function row(id) { return rows().filter((r) => r.dataset.surveyId === id)[0]; }
@@ -382,7 +392,7 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
 (async () => {
   console.log("\n== A. 骨架与 DOM id ==");
   setUser("u_t");
-  remount();
+  await remount();
   ["#collect-list", "#btn-collect-new", "#collect-detail", "#collect-form"].forEach((id) => {
     ok(root.querySelector(id) !== null, "存在 " + id);
   });
@@ -390,6 +400,8 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
     "管理端挂载即存在 #btn-ai-summary / #ai-summary-box（默认隐藏）");
   ok(root.querySelector("#btn-collect-new").hidden === false, "管理员可见「新建收集」");
   ok(root.querySelector("#collect-form").hidden === true, "表单默认隐藏");
+  ok(root.querySelector("#btn-collect-new").className.indexOf("admin-only") >= 0,
+    "管理动作按钮带 .admin-only（角色化）");
 
   console.log("\n== B. 列表：按截止排序 / 状态 / 进度 / 匿名 ==");
   ok(rowIds().join(",") === "sv_expired,sv_b,sv_stat,sv_dup,sv_xss,sv_a,sv_closed",
@@ -403,7 +415,7 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   ok(CA.iconCalls.indexOf("clock") >= 0 && CA.iconCalls.indexOf("clipboard") >= 0, "图标统一走 CA.icon()");
 
   console.log("\n== C. 创建收集表：字段完整 ==");
-  const before = CA.store.get("surveys").length;
+  const before = (await CA.store.get("surveys")).length;
   click(root.querySelector("#btn-collect-new"));
   ok(root.querySelector("#collect-form").hidden === false, "点击新建 → 表单展开");
   const form = root.querySelector("#collect-form");
@@ -425,7 +437,8 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   items[1].querySelector('[name="q_title"]').value = "补充说明";
 
   dispatch(form, { type: "submit" });
-  let surveys = CA.store.get("surveys");
+  await flush();
+  let surveys = await CA.store.get("surveys");
   ok(surveys.length === before + 1, "创建后 surveys 数量 +1");
   const created = surveys[surveys.length - 1];
   ok(created.title === "新问卷标题" && created.desc === "这是说明", "标题/说明正确");
@@ -444,9 +457,11 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
 
   console.log("\n== D. 校验：缺标题 / 缺选项被拦截 ==");
   click(root.querySelector("#btn-collect-new"));
+  await flush();
   const bad = root.querySelector("#collect-form");
   dispatch(bad, { type: "submit" });
-  ok(CA.store.get("surveys").length === before + 1, "非法提交不写入");
+  await flush();
+  ok((await CA.store.get("surveys")).length === before + 1, "非法提交不写入");
   ok(root.querySelector("#collect-form").hidden === false, "校验失败表单保持展开");
   ok(CA.collect.validate({ title: "", questions: [] }).ok === false, "validate 空草案不通过");
   ok(CA.collect.validate({
@@ -461,7 +476,7 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   ok(root.querySelector("#collect-form").hidden === true, "取消后表单收起");
 
   console.log("\n== E. 统计：票数 / 百分比 / 未提交名单 ==");
-  const st = CA.collect.stats("sv_stat");
+  const st = await CA.collect.stats("sv_stat");
   ok(st.submitted === 4 && st.total === 6, "已交 4 / 总 6");
   ok(st.questions[0].counts.A === 2 && st.questions[0].counts.B === 1 && st.questions[0].counts.C === 1, "票数 A2/B1/C1");
   const bd = st.questions[0].breakdown;
@@ -469,9 +484,10 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   ok(bd.filter((b) => b.label === "B")[0].percent === 25, "B 占比 25%");
   ok(st.missing.length === 2 && st.missing.indexOf("林晓萌") >= 0 && st.missing.indexOf("赵敏") >= 0,
     "未提交名单 = 林晓萌、赵敏");
-  ok(surveyStatsCalls.indexOf("sv_stat") >= 0, "统计复用 CA.ai.surveyStats");
+  ok(surveyStatsCalls.indexOf("sv_stat") >= 0, "统计尽力复用 CA.ai.surveyStats");
 
   click(row("sv_stat"));
+  await flush();
   ok(root.querySelector("#collect-detail").hidden === false, "点击列表 → 详情展开");
   const optCounts = root.querySelectorAll("#collect-detail .opt-count").map((n) => n.textContent);
   ok(optCounts.join("|").indexOf("2 票（50%）") >= 0, "结果渲染票数 + 百分比进度条文案");
@@ -496,17 +512,20 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
 
   console.log("\n== G. 关闭 / 重开 ==");
   click(byText(root.querySelectorAll("#collect-detail .btn"), "关闭收集"));
-  ok(CA.store.find("surveys", "sv_stat").status === "closed", "关闭写入 status=closed");
+  await flush();
+  ok((await CA.store.find("surveys", "sv_stat")).status === "closed", "关闭写入 status=closed");
   click(byText(root.querySelectorAll("#collect-detail .btn"), "重新开启"));
-  ok(CA.store.find("surveys", "sv_stat").status === "open", "重开写入 status=open");
+  await flush();
+  ok((await CA.store.find("surveys", "sv_stat")).status === "open", "重开写入 status=open");
 
   console.log("\n== H. 学生视角：只列进行中 / 已截止不可填 ==");
   setUser("u_s");
-  remount();
+  await remount();
   ok(root.querySelector("#btn-collect-new").hidden === true, "学生看不到「新建」");
   ok(rowIds().indexOf("sv_closed") < 0, "学生列表不含已关闭收集");
   ok(byText(row("sv_b").querySelectorAll(".badge"), "待填写") !== undefined, "未提交显示待填写");
   click(row("sv_expired"));
+  await flush();
   ok(root.querySelector("#collect-detail").textContent.indexOf("无法提交") >= 0, "过期收集学生不可填写");
   ok(root.querySelector("#collect-detail").querySelector("#collect-fill-form") === null, "过期不渲染填写表单");
   ok(root.querySelector("#btn-ai-summary") === null && root.querySelector("#ai-summary-box") === null,
@@ -515,11 +534,13 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
 
   console.log("\n== I. 学生提交 / 重复提交为更新 ==");
   click(row("sv_dup"));
+  await flush();
   let fill = root.querySelector("#collect-fill-form");
   ok(fill !== null, "点击进行中收集 → 渲染填写表单");
   // 必填校验：不选直接提交
   dispatch(fill, { type: "submit" });
-  ok(CA.store.query("responses", (r) => r.surveyId === "sv_dup").length === 0, "必填未选 → 不写入");
+  await flush();
+  ok((await CA.store.query("responses", (r) => r.surveyId === "sv_dup")).length === 0, "必填未选 → 不写入");
   ok(CA.app.toasts.indexOf("选项 为必填") >= 0, "必填校验给出提示");
 
   // 正常提交
@@ -527,7 +548,8 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   ok(radios.length === 2, "单选渲染为 radio 组");
   radios[0].checked = true;
   dispatch(fill, { type: "submit" });
-  let dupRes = CA.store.query("responses", (r) => r.surveyId === "sv_dup" && r.memberId === "m2");
+  await flush();
+  let dupRes = await CA.store.query("responses", (r) => r.surveyId === "sv_dup" && r.memberId === "m2");
   ok(dupRes.length === 1, "提交写入一条 response");
   ok(dupRes[0].answers.length === 1 && dupRes[0].answers[0].qid === "q1" && dupRes[0].answers[0].value === "A",
     "答案值正确写入");
@@ -539,28 +561,81 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   const modifyBtn = byText(root.querySelectorAll("#collect-detail .form-actions .btn"), "修改提交");
   ok(modifyBtn !== undefined, "存在「修改提交」入口");
   click(modifyBtn);
+  await flush();
   fill = root.querySelector("#collect-fill-form");
   const radios2 = fill.querySelectorAll('[name="ans_q1"]');
   radios2[1].checked = true; radios2[0].checked = false;
   dispatch(fill, { type: "submit" });
-  dupRes = CA.store.query("responses", (r) => r.surveyId === "sv_dup" && r.memberId === "m2");
+  await flush();
+  dupRes = await CA.store.query("responses", (r) => r.surveyId === "sv_dup" && r.memberId === "m2");
   ok(dupRes.length === 1, "重复提交数量不变（更新而非新增）");
   ok(dupRes[0].answers[0].value === "B", "重复提交覆盖为新答案");
-  ok(CA.store.get("responses").filter((r) => r.surveyId === "sv_dup").length === 1, "库中仍只有一条 sv_dup 记录");
+  ok((await CA.store.get("responses")).filter((r) => r.surveyId === "sv_dup").length === 1, "库中仍只有一条 sv_dup 记录");
 
   // 学生列表显示已提交徽标
-  remount();
+  await remount();
   ok(byText(row("sv_dup").querySelectorAll(".badge"), "已提交") !== undefined, "已提交的学生列表带「已提交」徽标");
+  ok(row("sv_dup").querySelector(".student-only") !== null, "学生状态标记带 .student-only（角色化）");
+
+  console.log("\n== I2. 学生文本题：AI 帮我写 ==");
+  setUser("u_s");
+  await remount();
+  click(row("sv_b"));
+  await flush();
+  const fill2 = root.querySelector("#collect-fill-form");
+  ok(fill2 !== null, "进行中收集渲染填写表单（sv_b）");
+  const aiComposeBtn = root.querySelector("#btn-ai-compose-q2");
+  ok(aiComposeBtn !== null, "文本题出现 #btn-ai-compose-<qid> 入口");
+  ok(aiComposeBtn.className.indexOf("btn-ai") >= 0, "AI 入口使用 .btn-ai（DESIGN §4.4）");
+  ok(aiComposeBtn.closest(".student-only") !== null, "AI 入口带 .student-only（角色化）");
+  ok(root.querySelector("#btn-ai-compose-q1") === null, "仅文本题有 AI 入口（单选题无）");
+
+  const ta2 = fill2.querySelector('[name="ans_q2"]');
+  CA.ai.composeAnswerCalls = [];
+  global.confirm = () => true;
+  ta2.value = "我自己的草稿";
+  click(aiComposeBtn);
+  await flush();
+  ok(CA.ai.composeAnswerCalls.length === 1, "点击 → 调用 CA.ai.composeAnswer");
+  ok(CA.ai.composeAnswerCalls[0].question === "备注", "question 传题目 title");
+  ok(CA.ai.composeAnswerCalls[0].hints === "请报名", "hints 回退到问卷说明（文本题无 options）");
+  ok(ta2.value === "AI 生成草稿内容", "返回文本填入 textarea（确认替换后）");
+  ok(CA.app.toasts.indexOf("已生成草稿，可修改") >= 0, "提示「已生成草稿，可修改」");
+
+  global.confirm = () => false;
+  ta2.value = "保留我写的";
+  const callsBefore = CA.ai.composeAnswerCalls.length;
+  click(aiComposeBtn);
+  await flush();
+  ok(ta2.value === "保留我写的", "已有内容且拒绝覆盖 → 保留原值");
+  ok(CA.ai.composeAnswerCalls.length === callsBefore, "拒绝覆盖时不调用 AI");
+  global.confirm = () => true;
+
+  const realCompose = CA.ai.composeAnswer;
+  CA.ai.composeAnswer = async () => { throw new Error("AI 生成失败测试"); };
+  const toastCount = CA.app.toasts.length;
+  click(aiComposeBtn);
+  await flush();
+  ok(CA.app.toasts.slice(toastCount).some((t) => t.indexOf("AI 生成失败测试") >= 0), "失败 → try/catch + toast");
+  CA.ai.composeAnswer = realCompose;
+
+  aiOn = false;
+  await remount();
+  click(row("sv_b"));
+  await flush();
+  ok(root.querySelector("#btn-ai-compose-q2") === null, "AI 关闭 → 不渲染 AI 入口");
+  aiOn = true;
 
   console.log("\n== J. XSS 转义 ==");
-  remount();
+  await remount();
   const xssRow = row("sv_xss");
   ok(xssRow.querySelector(".list-title-text").textContent === "<img src=x onerror=alert(1)>",
     "标题按纯文本渲染");
   ok(xssRow.querySelectorAll("img").length === 0, "未注入 img 元素");
   setUser("u_t");
-  remount();
+  await remount();
   click(row("sv_xss"));
+  await flush();
   const textItem = root.querySelector("#collect-detail .text-item");
   ok(textItem !== null && textItem.textContent.indexOf("<script>alert(1)</script>") >= 0,
     "文本回答按纯文本渲染");
@@ -571,15 +646,16 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   console.log("\n== K. AI 关闭 / 学生权限 ==");
   aiOn = false;
   setUser("u_t");
-  remount();
+  await remount();
   click(row("sv_stat"));
+  await flush();
   ok(root.querySelector("#btn-ai-summary").hidden === true, "AI 关闭 → 汇总按钮隐藏");
   ok(root.querySelector("#ai-summary-box").textContent.indexOf("未开启") >= 0 ||
      root.querySelector("#ai-summary-box").innerHTML.indexOf("未开启") >= 0, "AI 关闭有提示文案");
   aiOn = true;
 
   console.log("\n========================================");
-  console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过 ✅"}`);
+  console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过"}`);
   process.exit(failCount ? 1 : 0);
 })().catch((e) => {
   console.error("\n测试中断:", (e && e.stack) || e);

@@ -1,7 +1,11 @@
-// scores.js —— 成绩中心视图 + 纯统计函数
+// scores.js —— 成绩中心视图 + 纯统计函数（P1b 异步迁移版）
 // 角色：管理员（录入/统计/图表/AI）与学生（只看自己）。
-// 对外：CA.views.scores = { mount, unmount }、CA.scores.stats.*、CA.scores.parseImport/applyImport
-// UI：遵循 DESIGN.md 第 4 节类名（.card/.stat/.table/.btn-ai/.empty 等），禁止 emoji 图标。
+// 数据层：CA.store 已切 CloudBase PG（返回 Promise）；CA.auth.current() 亦为异步。
+//         除 memberName/settings/uid 外一律 await；渲染统一读内存缓存，写后再整体刷新。
+// 学生可见性：由 RLS 保证（学生只读到本人成绩），前端仅做展示降级，不做权限过滤。
+// 对外：CA.views.scores = { mount, unmount }、CA.scores.stats.*、
+//       CA.scores.parseImport（异步）/ parseImportText（纯函数）/ applyImport（异步）
+// UI：遵循 DESIGN.md（§4 类名、§10 角色差异化 .admin-only/.student-only），禁止 emoji 图标。
 window.CA = window.CA || {};
 
 (function () {
@@ -15,6 +19,8 @@ window.CA = window.CA || {};
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
+
+  function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
   function round1(v) {
     const n = Number(v);
@@ -63,6 +69,9 @@ window.CA = window.CA || {};
     }
     return el;
   }
+
+  // 在 root 内查询（安全返回 null）
+  function q(sel) { return (state && state.root) ? state.root.querySelector(sel) : null; }
 
   // ============================================================
   // 图标（禁止 emoji）：优先用全局 CA.icon（icons.js），缺失时回退内置 SVG
@@ -115,7 +124,7 @@ window.CA = window.CA || {};
     return b;
   }
 
-  // 按钮 loading 态：.is-loading（styles.css 自带 ::before spinner）+ 「生成中…」+ disabled
+  // 按钮 loading 态：.is-loading（styles.css 自带 ::before spinner）+ 文案替换 + disabled
   function setBtnLoading(btn, on, text) {
     if (!btn) return;
     const lbl = btn.querySelector ? btn.querySelector(".btn-label") : null;
@@ -238,25 +247,31 @@ window.CA = window.CA || {};
       return le / a.length * 100;
     }
 
-    // 某考试各科统计（依赖 CA.store）
+    // 某考试各科统计（异步：依赖 CA.store）
     function subjectStats(examId) {
-      const subjects = (CA.store.get("subjects") || []).slice().sort(function (a, b) {
-        return (a.order || 0) - (b.order || 0);
-      });
-      const scores = CA.store.query("scores", function (s) { return s.examId === examId; });
-      return subjects.map(function (sub) {
-        const arr = scores.filter(function (s) { return s.subjectId === sub.id; }).map(function (s) { return s.score; });
-        return {
-          subjectId: sub.id,
-          name: sub.name,
-          fullScore: sub.fullScore,
-          mean: mean(arr),
-          max: maxOf(arr),
-          min: minOf(arr),
-          pass: passRate(arr, sub.fullScore),
-          excellent: excellentRate(arr, sub.fullScore),
-          count: arr.length,
-        };
+      return Promise.all([
+        CA.store.get("subjects"),
+        CA.store.query("scores", function (s) { return s.examId === examId; }),
+      ]).then(function (arr) {
+        const subjects = (arr[0] || []).slice().sort(function (a, b) {
+          return (a.order || 0) - (b.order || 0);
+        });
+        const scores = arr[1] || [];
+        return subjects.map(function (sub) {
+          const vals = scores.filter(function (s) { return s.subjectId === sub.id; })
+            .map(function (s) { return s.score; });
+          return {
+            subjectId: sub.id,
+            name: sub.name,
+            fullScore: sub.fullScore,
+            mean: mean(vals),
+            max: maxOf(vals),
+            min: minOf(vals),
+            pass: passRate(vals, sub.fullScore),
+            excellent: excellentRate(vals, sub.fullScore),
+            count: vals.length,
+          };
+        });
       });
     }
 
@@ -276,14 +291,15 @@ window.CA = window.CA || {};
   })();
 
   // ============================================================
-  // 批量导入解析（纯函数，便于单测）
+  // 批量导入解析
+  // parseImportText：纯函数（显式传入 members/subjects，便于单测）
   // 每行：学号,科目,分数  或  姓名 科目 分数（分隔符：中英文逗号/空格/制表符）
   // 返回 { rows:[...], okCount, failCount }
   // ============================================================
-  function parseImport(text) {
+  function parseImportText(text, members, subjects) {
     const lines = String(text == null ? "" : text).split(/\r?\n/);
-    const members = CA.store.get("members") || [];
-    const subjects = CA.store.get("subjects") || [];
+    members = members || [];
+    subjects = subjects || [];
     const seen = {};
     const rows = [];
     let okCount = 0;
@@ -366,38 +382,53 @@ window.CA = window.CA || {};
     return { rows: rows, okCount: okCount, failCount: failCount };
   }
 
-  // 写入解析结果：存在则更新，否则新增；返回 {added, updated, failed}
-  function applyImport(parsed, examId) {
-    let added = 0, updated = 0, failed = 0;
-    (parsed && parsed.rows ? parsed.rows : []).forEach(function (r) {
-      if (!r.ok) return;
-      try {
-        const all = CA.store.get("scores") || [];
-        let existing = null;
-        for (let i = 0; i < all.length; i++) {
-          if (all[i].examId === examId && all[i].subjectId === r.subjectId && all[i].memberId === r.memberId) {
-            existing = all[i];
-            break;
-          }
-        }
-        if (existing) {
-          CA.store.update("scores", existing.id, { score: r.score, examId: examId, subjectId: r.subjectId, memberId: r.memberId });
-          updated++;
-        } else {
-          CA.store.add("scores", { examId: examId, subjectId: r.subjectId, memberId: r.memberId, score: r.score });
-          added++;
-        }
-      } catch (e) {
-        failed++;
-      }
+  // 异步包装：从 store 拉取名单/科目后解析（RLS 下学生也可读 members/subjects）
+  function parseImport(text) {
+    return Promise.all([
+      safe(CA.store.get("members"), []),
+      safe(CA.store.get("subjects"), []),
+    ]).then(function (arr) {
+      return parseImportText(text, arr[0], arr[1]);
     });
-    return { added: added, updated: updated, failed: failed };
+  }
+
+  // 写入解析结果：存在则更新，否则新增；返回 Promise<{added, updated, failed}>
+  // existingScores 可选：传入缓存避免重复请求（视图内部使用）
+  function applyImport(parsed, examId, existingScores) {
+    const rows = (parsed && parsed.rows) ? parsed.rows : [];
+    return Promise.resolve(existingScores != null ? existingScores : CA.store.get("scores"))
+      .then(function (all) {
+        const index = {};
+        (all || []).forEach(function (r) {
+          index[r.examId + "|" + r.subjectId + "|" + r.memberId] = r;
+        });
+        let added = 0, updated = 0, failed = 0;
+        let chain = Promise.resolve();
+        rows.forEach(function (r) {
+          if (!r.ok) return;
+          chain = chain.then(function () {
+            const key = examId + "|" + r.subjectId + "|" + r.memberId;
+            const ex = index[key];
+            const op = ex
+              ? CA.store.update("scores", ex.id, { score: r.score, examId: examId, subjectId: r.subjectId, memberId: r.memberId })
+              : CA.store.add("scores", { examId: examId, subjectId: r.subjectId, memberId: r.memberId, score: r.score });
+            return Promise.resolve(op).then(function (saved) {
+              if (ex) { updated++; if (saved) index[key] = saved; }
+              else { added++; if (saved) index[key] = saved; }
+            }, function () {
+              failed++; // 单行失败（如 RLS 拒绝 42501）不中断整批
+            });
+          });
+        });
+        return chain.then(function () { return { added: added, updated: updated, failed: failed }; });
+      });
   }
 
   // ============================================================
-  // 视图状态
+  // 视图状态与缓存
   // ============================================================
   let state = null;
+  let mountToken = 0;
   let styleInjected = false;
 
   function aiEnabled() {
@@ -406,7 +437,7 @@ window.CA = window.CA || {};
   }
 
   // 仅补齐 styles.css 尚未提供的样式（markdown 排版 / 学生 hero / 窄输入框）
-  // 全部使用 CSS 变量，无硬编码颜色；不覆盖设计系统已有类
+  // 全部使用 CSS 变量，无硬编码颜色；除下方 KPI 可读性补丁外不覆盖设计系统已有类
   function injectScopedStyles() {
     if (styleInjected) return;
     styleInjected = true;
@@ -421,75 +452,84 @@ window.CA = window.CA || {};
       ".md ul{margin:8px 0;padding-left:20px}" +
       ".md li{margin:2px 0}" +
       ".md strong{color:var(--text)}" +
+      // 图表容器固定高 280px：收窄插画空态内边距与尺寸，避免溢出
+      ".scores-view .chart .empty{padding:18px 16px}" +
+      ".scores-view .chart .empty-icon.ca-art{width:120px;height:120px}" +
       ".student-hero{background:var(--primary-soft);border-color:transparent}" +
       ".student-hero .stat{background:var(--surface)}" +
       ".student-hero .stat-value{color:var(--primary-text)}" +
-      ".subject-meta{display:flex;align-items:center;gap:8px;margin:-2px 0 10px 74px}";
+      ".subject-meta{display:flex;align-items:center;gap:8px;margin:-2px 0 10px 74px}" +
+      // v4 主色底概览（.card-ink）内的 KPI 浅色磁贴：恢复深色文字（否则 .card-ink 的反白规则会让数字不可见）；
+      // 语义色（.stat.success/.warn/.danger/.emphasis，特异度更高）不受影响，仍然生效。
+      ".scores-view .stat-value{color:var(--text)}" +
+      ".scores-view .stat-label{color:var(--text-3)}";
     const style = document.createElement("style");
     style.setAttribute("type", "text/css");
     style.textContent = css;
     document.head.appendChild(style);
   }
 
-  // ---------- 数据辅助 ----------
-  function sortedExams() {
-    return (CA.store.get("exams") || []).slice().sort(function (a, b) {
-      return String(a.date || "").localeCompare(String(b.date || ""));
-    });
+  // ---------- 通用 Promise 工具 ----------
+  function safe(p, fallback) {
+    return Promise.resolve(p).then(function (v) { return v; }, function () { return fallback; });
   }
-  function sortedSubjects() {
-    return (CA.store.get("subjects") || []).slice().sort(function (a, b) {
-      return (a.order || 0) - (b.order || 0);
-    });
-  }
-  function sortedMembers() {
-    return (CA.store.get("members") || []).slice().sort(function (a, b) {
-      return String(a.studentNo || "").localeCompare(String(b.studentNo || ""));
-    });
-  }
+
+  // ---------- 数据辅助（读缓存，同步） ----------
+  function subjectsSorted() { return state.subjects || []; }
+  function examsSorted() { return state.exams || []; }
+  function membersSorted() { return state.members || []; }
+
   function ensureExam() {
-    const exams = sortedExams();
+    const exams = examsSorted();
     if (!exams.length) { state.examId = null; return; }
     const found = exams.some(function (e) { return e.id === state.examId; });
     if (!found) state.examId = exams[exams.length - 1].id; // 默认最近一次考试
   }
   function ensureSubject() {
-    const subjects = sortedSubjects();
+    const subjects = subjectsSorted();
     if (state.subjectId !== "all" && !subjects.some(function (s) { return s.id === state.subjectId; })) {
       state.subjectId = "all";
     }
   }
   function examName(id) {
-    const exams = sortedExams();
+    const exams = examsSorted();
     for (let i = 0; i < exams.length; i++) if (exams[i].id === id) return exams[i].name;
     return "";
   }
   function subjectName(id) {
-    const subjects = sortedSubjects();
+    if (id === "all") return "全部科目";
+    const subjects = subjectsSorted();
     for (let i = 0; i < subjects.length; i++) if (subjects[i].id === id) return subjects[i].name;
     return "全部科目";
   }
+  function memberNameOf(memberId) {
+    try { if (CA.store && typeof CA.store.memberName === "function") return CA.store.memberName(memberId) || ""; }
+    catch (e) { /* 忽略 */ }
+    const members = membersSorted();
+    for (let i = 0; i < members.length; i++) if (members[i].id === memberId) return members[i].name || "";
+    return "";
+  }
 
-  // 学生本人对应的名单 id
-  function myMemberId() {
-    const u = (CA.auth && CA.auth.current && CA.auth.current()) || {};
-    const members = CA.store.get("members") || [];
-    if (u.studentNo) {
-      for (let i = 0; i < members.length; i++) if (String(members[i].studentNo) === String(u.studentNo)) return members[i].id;
+  // 本人对应的名单 id：优先 auth 归一化返回的 memberId，退化为按学号/姓名匹配
+  function resolveMemberId(me) {
+    if (me && me.memberId) return me.memberId;
+    const members = membersSorted();
+    if (me && me.studentNo) {
+      for (let i = 0; i < members.length; i++) if (String(members[i].studentNo) === String(me.studentNo)) return members[i].id;
     }
-    if (u.name) {
-      for (let i = 0; i < members.length; i++) if (members[i].name === u.name) return members[i].id;
+    if (me && me.name) {
+      for (let i = 0; i < members.length; i++) if (members[i].name === me.name) return members[i].id;
     }
     return null;
   }
 
   // 某考试范围内成绩的聚合统计（subjectIds 为 null 表示全部科目）
   function aggregate(examId, subjectIds) {
-    const scores = CA.store.query("scores", function (s) {
+    const scores = (state.scores || []).filter(function (s) {
       return s.examId === examId && (subjectIds == null || subjectIds.indexOf(s.subjectId) >= 0);
     });
     const fullMap = {};
-    (CA.store.get("subjects") || []).forEach(function (s) { fullMap[s.id] = s.fullScore; });
+    subjectsSorted().forEach(function (s) { fullMap[s.id] = s.fullScore; });
     const vals = scores.map(function (s) { return s.score; });
     let pass = 0, exc = 0;
     scores.forEach(function (s) {
@@ -538,39 +578,11 @@ window.CA = window.CA || {};
   }
 
   // ---------- 空态 / 通用片段 ----------
-  // 空态插画（几何线条风，~120px）
-  const EMPTY_ART = {
-    chart:
-      '<circle class="ea-soft" cx="26" cy="26" r="11"/>' +
-      '<rect class="ea-plate" x="20" y="26" width="80" height="66" rx="12"/>' +
-      '<rect class="ea-bar" x="32" y="68" width="10" height="14" rx="3"/>' +
-      '<rect class="ea-bar" x="47" y="58" width="10" height="24" rx="3"/>' +
-      '<rect class="ea-bar-solid" x="62" y="62" width="10" height="20" rx="3"/>' +
-      '<rect class="ea-bar" x="77" y="48" width="10" height="34" rx="3"/>' +
-      '<path class="ea-accent" d="M34 52l15-9 13 6 17-15"/>' +
-      '<path class="ea-accent" d="M70 33h10v10"/>',
-    calendar:
-      '<circle class="ea-soft" cx="90" cy="30" r="12"/>' +
-      '<rect class="ea-plate" x="24" y="28" width="72" height="64" rx="12"/>' +
-      '<path class="ea-line" d="M24 46h72"/>' +
-      '<path class="ea-line" d="M42 20v12M78 20v12"/>' +
-      '<path class="ea-accent" d="M40 62h10M40 76h10M60 62h10M60 76h10"/>',
-    users:
-      '<circle class="ea-soft" cx="90" cy="32" r="13"/>' +
-      '<circle class="ea-plate" cx="60" cy="50" r="16"/>' +
-      '<path class="ea-plate" d="M32 92a28 28 0 0 1 56 0"/>' +
-      '<circle class="ea-plate" cx="34" cy="60" r="11"/>' +
-      '<path class="ea-plate" d="M16 88a19 19 0 0 1 34-4"/>'
-  };
-  function emptyArtFor(name) {
-    if (name === "calendar") return EMPTY_ART.calendar;
-    if (name === "users") return EMPTY_ART.users;
-    return EMPTY_ART.chart;
-  }
+  // v4：空态统一用 Agnes 插画（.empty-icon ca-art ca-art-scores，见 DESIGN.md §4.10/§13.1）。
+  // iconName 仅为兼容既有调用点保留，不再用于选择旧线性 SVG。
   function emptyHtml(iconName, title, desc) {
     return '<div class="empty">' +
-      '<div class="empty-art" aria-hidden="true"><svg viewBox="0 0 120 120" fill="none">' +
-      emptyArtFor(iconName) + "</svg></div>" +
+      '<div class="empty-icon ca-art ca-art-scores" aria-hidden="true"></div>' +
       '<div class="empty-title">' + esc(title) + "</div>" +
       (desc ? '<p class="empty-desc">' + esc(desc) + "</p>" : "") +
       "</div>";
@@ -614,10 +626,10 @@ window.CA = window.CA || {};
     return row;
   }
 
-  // ---------- 下拉框 ----------
+  // ---------- 下拉框（读缓存，change 后同步重渲染） ----------
   function buildExamSelect() {
     const sel = h("select", { id: "exam-select", class: "input" });
-    const exams = sortedExams();
+    const exams = examsSorted();
     if (!exams.length) {
       sel.appendChild(h("option", { value: "", text: "（暂无考试）" }));
       return sel;
@@ -641,7 +653,7 @@ window.CA = window.CA || {};
     const all = h("option", { value: "all", text: "全部科目" });
     if (state.subjectId === "all") all.setAttribute("selected", "");
     sel.appendChild(all);
-    sortedSubjects().forEach(function (s) {
+    subjectsSorted().forEach(function (s) {
       const op = h("option", { value: s.id, text: s.name + "（满分" + s.fullScore + "）" });
       if (s.id === state.subjectId) op.setAttribute("selected", "");
       sel.appendChild(op);
@@ -655,15 +667,15 @@ window.CA = window.CA || {};
   }
 
   // ============================================================
-  // 管理员视图
+  // 管理员视图（老师 / 管理员）—— 全部管理动作标记 .admin-only（DESIGN §10.2）
   // ============================================================
   function renderAdmin() {
     const root = state.root;
-    const box = h("div", { class: "scores-view" });
+    const box = h("div", { class: "scores-view admin-only" });
 
     // --- 工具栏 ---
-    const toolbar = h("div", { class: "card" });
-    const importBtn = makeBtn({ class: "btn", id: "btn-score-import", type: "button" }, "upload", "批量录入");
+    const toolbar = h("div", { class: "card admin-only" });
+    const importBtn = makeBtn({ class: "btn btn-primary admin-only", id: "btn-score-import", type: "button" }, "upload", "批量录入");
     toolbar.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("chart", 20), h("span", { text: "成绩中心" })]),
       importBtn,
@@ -675,7 +687,7 @@ window.CA = window.CA || {};
     box.appendChild(toolbar);
 
     // --- 批量导入面板 ---
-    const importPanel = h("div", { class: "card", hidden: true });
+    const importPanel = h("div", { class: "card admin-only", hidden: true });
     importPanel.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("clipboard", 18), h("span", { text: "批量录入" })]),
     ]));
@@ -688,15 +700,15 @@ window.CA = window.CA || {};
       importInput,
       h("span", { class: "field-hint", text: "支持中英文逗号、空格、制表符分隔；同一学生同一科目重复行会报错。" }),
     ]));
-    const parseBtn = makeBtn({ class: "btn", id: "btn-score-parse", type: "button" }, "search", "解析预览");
-    const confirmBtn = makeBtn({ class: "btn btn-primary", id: "btn-score-confirm", type: "button", hidden: true }, "check", "确认写入");
+    const parseBtn = makeBtn({ class: "btn btn-quiet btn-labeled", id: "btn-score-parse", type: "button" }, "search", "解析预览");
+    const confirmBtn = makeBtn({ class: "btn btn-primary btn-labeled", id: "btn-score-confirm", type: "button", hidden: true }, "check", "确认写入");
     const previewBox = h("div", { class: "text-sm" });
-    importPanel.appendChild(h("div", { class: "form-actions" }, [parseBtn, confirmBtn]));
+    importPanel.appendChild(h("div", { class: "form-actions manage-actions" }, [parseBtn, confirmBtn]));
     importPanel.appendChild(previewBox);
     box.appendChild(importPanel);
 
-    // --- 统计卡片 ---
-    const statsCard = h("div", { class: "card" });
+    // --- 统计卡片（v4：概览用 .card-ink 墨底反白海报块） ---
+    const statsCard = h("div", { class: "card card-ink" });
     const statsSub = h("div", { class: "card-sub", text: "" });
     statsCard.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("trend-up", 18), h("span", { text: "成绩概览" })]),
@@ -707,7 +719,7 @@ window.CA = window.CA || {};
     box.appendChild(statsCard);
 
     // --- 成绩表 ---
-    const tableCard = h("div", { class: "card" });
+    const tableCard = h("div", { class: "card admin-only" });
     tableCard.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("users", 18), h("span", { text: "成绩表" })]),
       h("div", { class: "card-sub", text: "点击分数可编辑 · 点击行选择学生" }),
@@ -740,7 +752,7 @@ window.CA = window.CA || {};
       disabled: !aiOn || !state.examId, hidden: !aiOn,
     }, "sparkles", "生成报告");
     const reportBox = h("div", { class: "md", id: "ai-report-box", html: '<p class="muted">点击「生成报告」，AI 将根据本次考试成绩生成班级分析。</p>' });
-    box.appendChild(h("div", { class: "card" }, [
+    box.appendChild(h("div", { class: "card admin-only" }, [
       h("div", { class: "card-head" }, [
         h("div", { class: "card-title" }, [iconSpan("sparkles", 18), h("span", { text: "AI 班级分析报告" }), h("span", { class: "badge badge-ai", text: "AI" })]),
         reportBtn,
@@ -753,10 +765,10 @@ window.CA = window.CA || {};
       class: "btn btn-ai", id: "btn-ai-comment", type: "button",
       disabled: true, hidden: !aiOn,
     }, "sparkles", "生成评语");
-    const copyBtn = makeBtn({ class: "btn btn-sm", id: "btn-ai-comment-copy", type: "button", hidden: true }, "download", "复制");
+    const copyBtn = makeBtn({ class: "btn btn-sm btn-quiet", id: "btn-ai-comment-copy", type: "button", hidden: true }, "download", "复制");
     const selectedHint = h("span", { class: "muted text-sm", id: "score-selected-hint", text: "（点击表格中的学生行选择）" });
     const commentBox = h("div", { class: "md", id: "ai-comment-box", html: '<p class="muted">选择一名学生后生成个性化评语。</p>' });
-    box.appendChild(h("div", { class: "card" }, [
+    box.appendChild(h("div", { class: "card admin-only" }, [
       h("div", { class: "card-head" }, [
         h("div", { class: "card-title" }, [iconSpan("user", 18), h("span", { text: "AI 个人评语" })]),
         selectedHint, copyBtn, commentBtn,
@@ -778,7 +790,8 @@ window.CA = window.CA || {};
     });
 
     parseBtn.addEventListener("click", function () {
-      const parsed = parseImport(importInput.value);
+      // 纯函数解析（用缓存名单/科目，不发请求）
+      const parsed = parseImportText(importInput.value, state.members, state.subjects);
       state._parsed = parsed;
       renderPreview(previewBox, parsed);
       confirmBtn.hidden = parsed.okCount === 0;
@@ -788,10 +801,18 @@ window.CA = window.CA || {};
     confirmBtn.addEventListener("click", function () {
       if (!state._parsed || !state._parsed.okCount) return;
       if (!state.examId) { toast("请先选择考试", "error"); return; }
-      const res = applyImport(state._parsed, state.examId);
-      toast("导入完成：新增 " + res.added + "，更新 " + res.updated + "，失败 " + res.failed, "success");
-      state._parsed = null;
-      render();
+      setBtnLoading(confirmBtn, true, "写入中…");
+      applyImport(state._parsed, state.examId, state.scores)
+        .then(function (res) {
+          toast("导入完成：新增 " + res.added + "，更新 " + res.updated + "，失败 " + res.failed, res.failed ? "warn" : "success");
+          state._parsed = null;
+          return reloadScores();
+        })
+        .then(function () { render(); })
+        .catch(function (e) {
+          toast((e && e.message) || "导入失败", "error");
+          setBtnLoading(confirmBtn, false);
+        });
     });
 
     reportBtn.addEventListener("click", generateReport);
@@ -811,8 +832,8 @@ window.CA = window.CA || {};
   // 刷新统计卡片（7 张，带语义色）
   function refreshStats(container, subEl) {
     const scope = state.subjectId === "all"
-      ? sortedSubjects()
-      : sortedSubjects().filter(function (s) { return s.id === state.subjectId; });
+      ? subjectsSorted()
+      : subjectsSorted().filter(function (s) { return s.id === state.subjectId; });
     if (subEl) {
       subEl.textContent = state.examId
         ? (examName(state.examId) + " · " + subjectName(state.subjectId))
@@ -851,10 +872,10 @@ window.CA = window.CA || {};
       container.innerHTML = emptyHtml("calendar", "暂无考试数据", "导入或录入成绩后，这里会显示班级成绩表。");
       return;
     }
-    const subjects = sortedSubjects();
+    const subjects = subjectsSorted();
     const cols = state.subjectId === "all" ? subjects : subjects.filter(function (s) { return s.id === state.subjectId; });
-    const members = sortedMembers();
-    const scores = CA.store.query("scores", function (s) { return s.examId === examId; });
+    const members = membersSorted();
+    const scores = (state.scores || []).filter(function (s) { return s.examId === examId; });
 
     if (!members.length) {
       container.innerHTML = emptyHtml("users", "暂无班级名单", "请先在设置中维护班级名单。");
@@ -874,12 +895,12 @@ window.CA = window.CA || {};
         const rec = map[mid] && map[mid][state.subjectId];
         return rec ? Number(rec.score) : null;
       }
-      let sum = 0, has = false;
+      let sum = 0, hasRec = false;
       cols.forEach(function (sub) {
         const rec = map[mid] && map[mid][sub.id];
-        if (rec) { sum += Number(rec.score); has = true; }
+        if (rec) { sum += Number(rec.score); hasRec = true; }
       });
-      return has ? sum : null;
+      return hasRec ? sum : null;
     }
     const totalsByMember = {};
     const allTotals = [];
@@ -889,7 +910,7 @@ window.CA = window.CA || {};
       if (t != null) allTotals.push(t);
     });
 
-    const table = h("table", { class: "table" });
+    const table = h("table", { class: "table table-compact" });
     // 表头
     const thead = h("thead");
     const hr = h("tr");
@@ -949,40 +970,45 @@ window.CA = window.CA || {};
     container.appendChild(table);
   }
 
+  // 单元格编辑（异步写库）：ACL 拒绝（学生/无权限）会进 catch 并 toast
   function handleCellEdit(member, subject, rec, raw) {
     const rawStr = String(raw == null ? "" : raw).trim();
-    if (rawStr === "") {
-      if (rec) CA.store.remove("scores", rec.id); // 清空 = 删除
-      render();
-      return;
-    }
-    const num = Number(rawStr);
-    if (!isFinite(num) || num < 0 || num > subject.fullScore) {
-      toast("分数非法（0~" + subject.fullScore + "）", "error");
-      render();
-      return;
-    }
-    if (rec) CA.store.update("scores", rec.id, { score: num });
-    else CA.store.add("scores", { examId: state.examId, subjectId: subject.id, memberId: member.id, score: num });
-    selectMember(member.id, true);
-    render();
+    const write = function () {
+      if (rawStr === "") {
+        return rec ? CA.store.remove("scores", rec.id) : Promise.resolve(true); // 清空 = 删除
+      }
+      const num = Number(rawStr);
+      if (!isFinite(num) || num < 0 || num > subject.fullScore) {
+        return Promise.reject(new Error("分数非法（0~" + subject.fullScore + "）"));
+      }
+      if (rec) return CA.store.update("scores", rec.id, { score: num });
+      return CA.store.add("scores", { examId: state.examId, subjectId: subject.id, memberId: member.id, score: num });
+    };
+    return Promise.resolve()
+      .then(write)
+      .then(function () { return reloadScores(); })
+      .then(function () { selectMember(member.id, true); render(); })
+      .catch(function (e) {
+        toast((e && e.message) || "保存失败", "error");
+        return reloadScores().then(function () { render(); });
+      });
   }
 
   function selectMember(memberId, keepComment) {
     state.selectedMemberId = memberId;
-    const name = CA.store.memberName ? CA.store.memberName(memberId) : "";
+    const name = memberNameOf(memberId);
     if (state.commentBox && !keepComment) {
       state.commentBox.innerHTML = '<p class="muted">已选择「' + esc(name) + '」，点击「生成评语」。</p>';
       state.lastComment = "";
     }
     if (state.copyBtn) state.copyBtn.hidden = true;
-    const hint = state.root && state.root.querySelector ? state.root.querySelector("#score-selected-hint") : null;
+    const hint = q("#score-selected-hint");
     if (hint) hint.textContent = name ? "已选择：" + name : "";
-    const btn = state.root && state.root.querySelector ? state.root.querySelector("#btn-ai-comment") : null;
+    const btn = q("#btn-ai-comment");
     if (btn && aiEnabled()) btn.disabled = false;
   }
 
-  // 刷新三个图表
+  // 刷新三个图表（同步，读缓存）
   function refreshCharts() {
     const examId = state.examId;
     if (!examId) {
@@ -991,8 +1017,8 @@ window.CA = window.CA || {};
       renderEmptyInto(state.subjectEl, "暂无图表数据", "录入成绩后即可查看科目均分对比。");
       return;
     }
-    const subjects = sortedSubjects();
-    const scores = CA.store.query("scores", function (s) { return s.examId === examId; });
+    const subjects = subjectsSorted();
+    const scores = (state.scores || []).filter(function (s) { return s.examId === examId; });
     const scope = state.subjectId === "all" ? subjects : subjects.filter(function (s) { return s.id === state.subjectId; });
     const scopeIds = scope.map(function (s) { return s.id; });
     let maxFull = 100;
@@ -1010,7 +1036,7 @@ window.CA = window.CA || {};
     if (state.distEl && CA.charts) CA.charts.distribution(state.distEl, { title: "分数段分布", labels: b.labels, counts: b.counts });
 
     // 历次趋势
-    const exams = sortedExams();
+    const exams = examsSorted();
     const categories = exams.map(function (e) { return e.name; });
     let series;
     if (state.subjectId === "all") {
@@ -1036,10 +1062,10 @@ window.CA = window.CA || {};
   }
 
   function allScoresOf(examId) {
-    return CA.store.query("scores", function (s) { return s.examId === examId; }).map(function (s) { return s.score; });
+    return (state.scores || []).filter(function (s) { return s.examId === examId; }).map(function (s) { return s.score; });
   }
   function subjScoresOf(examId, subjectId) {
-    return CA.store.query("scores", function (s) { return s.examId === examId && s.subjectId === subjectId; }).map(function (s) { return s.score; });
+    return (state.scores || []).filter(function (s) { return s.examId === examId && s.subjectId === subjectId; }).map(function (s) { return s.score; });
   }
 
   // 导入预览
@@ -1089,11 +1115,12 @@ window.CA = window.CA || {};
     }, 1400);
   }
 
-  // ---------- AI 生成 ----------
+  // ---------- AI 生成（异步；等待 CA.ai 的 Promise） ----------
   function generateReport() {
     if (!aiEnabled()) return;
-    const btn = state.root.querySelector("#btn-ai-report");
+    const btn = q("#btn-ai-report");
     const boxEl = state.reportBox;
+    if (!boxEl) return;
     setBtnLoading(btn, true, "生成中…");
     boxEl.innerHTML = loadingHtml("AI 正在分析本次考试成绩…");
     Promise.resolve()
@@ -1113,8 +1140,9 @@ window.CA = window.CA || {};
 
   function generateComment() {
     if (!aiEnabled() || !state.selectedMemberId) return;
-    const btn = state.root.querySelector("#btn-ai-comment");
+    const btn = q("#btn-ai-comment");
     const boxEl = state.commentBox;
+    if (!boxEl) return;
     setBtnLoading(btn, true, "生成中…");
     boxEl.innerHTML = loadingHtml("AI 正在生成评语…");
     Promise.resolve()
@@ -1134,17 +1162,43 @@ window.CA = window.CA || {};
       });
   }
 
+  // 学生端 AI：成绩诊断 / 学习计划（异步；等待 CA.ai 的 Promise）
+  // kind ∈ "diagnose" | "plan"；仅学生端渲染的入口会调用
+  function generateStudentAI(kind) {
+    if (!aiEnabled() || !state.examId) return;
+    const isDiag = kind === "diagnose";
+    const btn = q(isDiag ? "#btn-ai-diagnose" : "#btn-ai-plan");
+    const boxEl = isDiag ? state.diagBox : state.planBox;
+    if (!boxEl) return;
+    setBtnLoading(btn, true, "生成中…");
+    boxEl.innerHTML = loadingHtml(isDiag ? "AI 正在诊断你的成绩…" : "AI 正在制定复习计划…");
+    Promise.resolve()
+      .then(function () {
+        return isDiag ? CA.ai.diagnoseScores(state.examId) : CA.ai.studyPlan(state.examId);
+      })
+      .then(function (res) {
+        const md = res && res.markdown != null ? res.markdown : (typeof res === "string" ? res : "");
+        boxEl.innerHTML = renderMarkdown(md);
+      })
+      .catch(function (e) {
+        boxEl.innerHTML = '<p class="field-error">生成失败：' + esc((e && e.message) || "未知错误") + "</p>";
+        toast((isDiag ? "AI 成绩诊断失败：" : "AI 学习计划失败：") + ((e && e.message) || "未知错误"), "error");
+      })
+      .then(function () {
+        setBtnLoading(btn, false);
+      });
+  }
+
   // ============================================================
-  // 学生视图（只看自己，鼓励性文案）
+  // 学生视图（只看自己，只读）
+  // 班级对比数据受 RLS 限制（学生仅能读本人成绩）：无多成员数据时做展示降级。
   // ============================================================
   function renderStudent() {
     const root = state.root;
-    const box = h("div", { class: "scores-view" });
-    const panel = h("div", { id: "student-score-panel" });
+    const box = h("div", { class: "scores-view student-only" });
+    const panel = h("div", { id: "student-score-panel", class: "student-only" });
     box.appendChild(panel);
     root.appendChild(box);
-
-    state.memberId = myMemberId();
     buildStudentPanel(panel);
   }
 
@@ -1162,68 +1216,103 @@ window.CA = window.CA || {};
       return;
     }
 
-    const subjects = sortedSubjects();
-    const scores = CA.store.query("scores", function (s) { return s.examId === examId; });
+    const subjects = subjectsSorted();
+    const examScores = (state.scores || []).filter(function (s) { return s.examId === examId; });
     const myScores = {};
-    scores.forEach(function (s) { if (s.memberId === mid) myScores[s.subjectId] = Number(s.score); });
+    examScores.forEach(function (s) { if (s.memberId === mid) myScores[s.subjectId] = Number(s.score); });
 
-    // 总分与名次、百分位（不暴露他人姓名）
+    // 班级口径：RLS 下学生只读到自己；>1 个成员才有班级对比
     const totals = {};
-    scores.forEach(function (s) { totals[s.memberId] = (totals[s.memberId] || 0) + Number(s.score); });
-    const allTotals = Object.keys(totals).map(function (k) { return totals[k]; });
-    const myTotal = totals[mid] != null ? totals[mid] : 0;
-    const rank = allTotals.length ? stats.rankOf(myTotal, allTotals) : 0;
-    const percentile = allTotals.length ? stats.percentileOf(myTotal, allTotals) : 0;
-    const classMeanTotal = allTotals.length ? stats.mean(allTotals) : 0;
-    const myName = (CA.store.memberName ? CA.store.memberName(mid) : "") || "同学";
+    examScores.forEach(function (s) { totals[s.memberId] = (totals[s.memberId] || 0) + Number(s.score); });
+    const memberIds = Object.keys(totals);
+    const hasClassData = memberIds.length > 1;
+    const allTotals = memberIds.map(function (k) { return totals[k]; });
+    const myName = memberNameOf(mid) || "同学";
 
-    // 考试选择
+    // 我的总分（不依赖班级数据）
+    let myTotal = 0, myHas = false, myFull = 0;
+    subjects.forEach(function (sub) {
+      if (myScores[sub.id] != null) {
+        myTotal += myScores[sub.id];
+        myFull += Number(sub.fullScore) || 100;
+        myHas = true;
+      }
+    });
+    const rank = hasClassData ? stats.rankOf(myTotal, allTotals) : 0;
+    const percentile = hasClassData ? stats.percentileOf(myTotal, allTotals) : (myFull ? myTotal / myFull * 100 : 0);
+    const classMeanTotal = hasClassData ? stats.mean(allTotals) : 0;
+
+    // 考试选择（保留 #exam-select）
     panel.appendChild(h("div", { class: "card" }, [
       h("div", { class: "row" }, [
         h("div", { class: "form-field" }, [h("span", { class: "label", text: "考试" }), buildExamSelect()]),
       ]),
     ]));
 
-    if (!scores.length) {
-      panel.innerHTML = emptyHtml("chart", "本次考试暂无成绩", "成绩录入后，这里会展示你的成绩单与班级对比。");
+    if (!examScores.length) {
+      panel.appendChild(h("div", { class: "card" }, [
+        h("div", { class: "card-title" }, [iconSpan("star", 18), h("span", { text: "我的成绩单" })]),
+        h("div", { class: "empty" }, [
+          h("div", { class: "empty-icon ca-art ca-art-scores", "aria-hidden": "true" }),
+          h("div", { class: "empty-title", text: "本次考试暂无成绩" }),
+          h("p", { class: "empty-desc", text: "成绩录入后，这里会展示你的成绩单与班级对比。" }),
+        ]),
+      ]));
       return;
     }
 
-    // --- 成绩单概览（温暖主色 hero） ---
-    const hero = h("div", { class: "card student-hero" });
+    // --- 成绩单概览（温暖主色 hero；v4：学生端加贴纸 / 荧光笔点缀，见 DESIGN §13.4） ---
+    const hero = h("div", { class: "card student-hero card-sticker" });
     hero.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("star", 18), h("span", { text: "我的成绩单" })]),
-      h("div", { class: "card-sub", text: examName(examId) }),
+      h("div", { class: "row" }, [
+        h("div", { class: "card-sub", text: examName(examId) }),
+        h("span", { class: "ca-sticker", text: "加油" }),
+      ]),
     ]));
-    hero.appendChild(h("p", { class: "muted", text: myName + "，你好！以下是本次考试的表现，每一次认真都值得肯定。" }));
+    hero.appendChild(h("p", { class: "muted" }, [
+      h("span", { class: "ca-marker", text: myName }),
+      h("span", { text: "，你好！以下是本次考试的表现，每一次认真都值得肯定。" }),
+    ]));
     const heroGrid = h("div", { class: "stat-grid" });
-    heroGrid.appendChild(statEl("emphasis", "我的总分", String(Math.round(myTotal))));
-    heroGrid.appendChild(statEl("", "班级名次", rank ? "第 " + rank + " / " + allTotals.length : "—"));
-    heroGrid.appendChild(statEl(allTotals.length && percentile >= 70 ? "success" : "", "班级位置", allTotals.length ? "前 " + Math.max(1, Math.round(100 - percentile)) + "%" : "—"));
-    heroGrid.appendChild(statEl("", "班级总分均分", fmtNum(classMeanTotal)));
+    heroGrid.appendChild(statEl("emphasis", "我的总分", myHas ? String(Math.round(myTotal)) : "—"));
+    heroGrid.appendChild(statEl("", "班级名次", hasClassData && rank ? "第 " + rank + " / " + allTotals.length : "—"));
+    heroGrid.appendChild(statEl(hasClassData && percentile >= 70 ? "success" : "", "班级位置",
+      hasClassData ? "前 " + Math.max(1, Math.round(100 - percentile)) + "%" : "—"));
+    heroGrid.appendChild(statEl("", "班级总分均分", hasClassData ? fmtNum(classMeanTotal) : "—"));
     hero.appendChild(heroGrid);
+    if (!hasClassData) {
+      hero.appendChild(h("p", { class: "muted text-sm", text: "班级对比数据仅对老师 / 管理员可见，这里展示你的个人成绩。" }));
+    }
+    panel.appendChild(hero);
 
-    // --- 排名定位 ---
+    // --- 排名定位（有班级数据时用百分位；否则展示个人得分率） ---
     const rankCard = h("div", { class: "card" });
     rankCard.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("award", 18), h("span", { text: "我的位置" })]),
     ]));
     const bars = h("div", { class: "bar-chart" });
-    bars.appendChild(barRow("班级位置", percentile, "超过 " + Math.round(percentile) + "%"));
-    rankCard.appendChild(bars);
-    rankCard.appendChild(h("p", { class: "muted", text: encourage(percentile) }));
+    if (hasClassData) {
+      bars.appendChild(barRow("班级位置", percentile, "超过 " + Math.round(percentile) + "%"));
+      rankCard.appendChild(bars);
+      rankCard.appendChild(h("p", { class: "muted", text: encourage(percentile) }));
+    } else {
+      const rate = myFull ? myTotal / myFull * 100 : 0;
+      bars.appendChild(barRow("个人得分率", rate, Math.round(rate) + "%"));
+      rankCard.appendChild(bars);
+      rankCard.appendChild(h("p", { class: "muted", text: encourage(rate) }));
+    }
     panel.appendChild(rankCard);
 
-    // --- 各科成绩与班级均分对比（横向进度条） ---
+    // --- 各科成绩（与班级均分对比；无班级数据时只显示得分率） ---
     const subjCard = h("div", { class: "card" });
     subjCard.appendChild(h("div", { class: "card-head" }, [
-      h("div", { class: "card-title" }, [iconSpan("book", 18), h("span", { text: "各科成绩与班级均分" })]),
+      h("div", { class: "card-title" }, [iconSpan("book", 18), h("span", { text: hasClassData ? "各科成绩与班级均分" : "各科成绩" })]),
       h("div", { class: "card-sub", text: "进度条为得分率" }),
     ]));
     const subjBars = h("div", { class: "bar-chart" });
     subjects.forEach(function (sub) {
       const my = myScores[sub.id];
-      const avg = stats.mean(subjScoresOf(examId, sub.id));
       const full = Number(sub.fullScore) || 100;
       if (my == null) {
         subjBars.appendChild(barRow(sub.name, 0, "—"));
@@ -1232,17 +1321,63 @@ window.CA = window.CA || {};
       }
       const rate = my / full * 100;
       subjBars.appendChild(barRow(sub.name, rate, my + " / " + full));
-      const diff = my - avg;
-      const above = diff >= 0;
-      subjBars.appendChild(h("div", { class: "subject-meta" }, [
-        h("span", { class: "muted text-sm", text: "班级均分 " + fmtNum(avg) }),
-        h("span", { class: "badge " + (above ? "badge-success" : "badge-muted"), text: above ? "高于均分 " + fmtNum(Math.abs(diff)) : "距均分 " + fmtNum(Math.abs(diff)) }),
-      ]));
+      if (hasClassData) {
+        const avg = stats.mean(subjScoresOf(examId, sub.id));
+        const diff = my - avg;
+        const above = diff >= 0;
+        subjBars.appendChild(h("div", { class: "subject-meta" }, [
+          h("span", { class: "muted text-sm", text: "班级均分 " + fmtNum(avg) }),
+          h("span", { class: "badge " + (above ? "badge-success" : "badge-muted"), text: above ? "高于均分 " + fmtNum(Math.abs(diff)) : "距均分 " + fmtNum(Math.abs(diff)) }),
+        ]));
+      } else {
+        subjBars.appendChild(h("div", { class: "subject-meta" }, [
+          h("span", { class: "badge " + (rate >= 85 ? "badge-lime" : "badge-muted"), text: rate >= 85 ? "优秀" : rate >= 60 ? "及格" : "待提升" }),
+        ]));
+      }
     });
     subjCard.appendChild(subjBars);
     panel.appendChild(subjCard);
 
-    // --- 个人历次趋势 ---
+    // --- AI 学习助手（仅学生端；DESIGN §4.4 .btn-ai / §4.3 .badge-ai；不使用 emoji） ---
+    const aiOn = aiEnabled();
+    const diagBtn = makeBtn({
+      class: "btn btn-ai", id: "btn-ai-diagnose", type: "button",
+      disabled: !aiOn, hidden: !aiOn,
+    }, "sparkles", "我的成绩诊断");
+    const diagBox = h("div", {
+      class: "md", id: "ai-diagnose-box", hidden: !aiOn,
+      html: '<p class="muted">点击「我的成绩诊断」，AI 将根据本次考试成绩分析你的优势与薄弱环节。</p>',
+    });
+    panel.appendChild(h("div", { class: "card student-only", hidden: !aiOn }, [
+      h("div", { class: "card-head" }, [
+        h("div", { class: "card-title" }, [iconSpan("sparkles", 18), h("span", { text: "我的成绩诊断" }), h("span", { class: "badge badge-ai", text: "AI" })]),
+        diagBtn,
+      ]),
+      diagBox,
+    ]));
+
+    const planBtn = makeBtn({
+      class: "btn btn-ai", id: "btn-ai-plan", type: "button",
+      disabled: !aiOn, hidden: !aiOn,
+    }, "sparkles", "AI 学习计划");
+    const planBox = h("div", {
+      class: "md", id: "ai-plan-box", hidden: !aiOn,
+      html: '<p class="muted">点击「AI 学习计划」，AI 将针对你的薄弱科目生成可执行的复习安排。</p>',
+    });
+    panel.appendChild(h("div", { class: "card student-only", hidden: !aiOn }, [
+      h("div", { class: "card-head" }, [
+        h("div", { class: "card-title" }, [iconSpan("sparkles", 18), h("span", { text: "AI 学习计划" }), h("span", { class: "badge badge-ai", text: "AI" })]),
+        planBtn,
+      ]),
+      planBox,
+    ]));
+
+    state.diagBox = diagBox;
+    state.planBox = planBox;
+    diagBtn.addEventListener("click", function () { generateStudentAI("diagnose"); });
+    planBtn.addEventListener("click", function () { generateStudentAI("plan"); });
+
+    // --- 个人历次趋势（保留 #chart-trend） ---
     const trendCard = h("div", { class: "card" });
     trendCard.appendChild(h("div", { class: "card-title", text: "我的历次趋势" }));
     const trendEl = h("div", { class: "chart", id: "chart-trend" });
@@ -1250,31 +1385,39 @@ window.CA = window.CA || {};
     panel.appendChild(trendCard);
 
     if (CA.charts) {
-      const exams = sortedExams();
-      const myTotals = exams.map(function (e) {
-        let sum = 0, has = false;
-        CA.store.query("scores", function (s) { return s.examId === e.id; }).forEach(function (s) {
-          if (s.memberId === mid) { sum += Number(s.score); has = true; }
-        });
-        return has ? sum : null;
-      });
-      const classTotals = exams.map(function (e) {
-        const m = {};
-        CA.store.query("scores", function (s) { return s.examId === e.id; }).forEach(function (s) {
-          m[s.memberId] = (m[s.memberId] || 0) + Number(s.score);
-        });
-        const arr = Object.keys(m).map(function (k) { return m[k]; });
-        return arr.length ? round1(stats.mean(arr)) : null;
-      });
+      const exams = examsSorted();
+      const series = [{ name: "我的总分", data: myTotalsByExam(mid) }];
+      if (hasClassData) series.push({ name: "班级均分", data: classMeanTotalsByExam() });
       CA.charts.trend(trendEl, {
         title: "我的历次总分",
         categories: exams.map(function (e) { return e.name; }),
-        series: [
-          { name: "我的总分", data: myTotals },
-          { name: "班级均分", data: classTotals },
-        ],
+        series: series,
       });
     }
+  }
+
+  // 某学生历次总分（读缓存）
+  function myTotalsByExam(mid) {
+    const exams = examsSorted();
+    return exams.map(function (e) {
+      let sum = 0, hasRec = false;
+      (state.scores || []).forEach(function (s) {
+        if (s.examId === e.id && s.memberId === mid) { sum += Number(s.score); hasRec = true; }
+      });
+      return hasRec ? sum : null;
+    });
+  }
+  // 历次班级均分（读缓存；学生无班级数据时退化为自身）
+  function classMeanTotalsByExam() {
+    const exams = examsSorted();
+    return exams.map(function (e) {
+      const m = {};
+      (state.scores || []).forEach(function (s) {
+        if (s.examId === e.id) m[s.memberId] = (m[s.memberId] || 0) + Number(s.score);
+      });
+      const arr = Object.keys(m).map(function (k) { return m[k]; });
+      return arr.length ? round1(stats.mean(arr)) : null;
+    });
   }
 
   function encourage(percentile) {
@@ -1283,6 +1426,83 @@ window.CA = window.CA || {};
     if (percentile >= 50) return "你在班级中处于中上水平，把错题弄懂会更好。";
     if (percentile >= 30) return "还有不小的进步空间，找对方法，一点点来。";
     return "每一次努力都算数，从复盘错题开始，你会看到进步的。";
+  }
+
+  // ============================================================
+  // 数据加载（异步）
+  // ============================================================
+  // scores 为关键数据（失败进错误态）；subjects/exams/members 尽力而为
+  function loadAll() {
+    const pScores = CA.store.get("scores");
+    const pSubjects = safe(CA.store.get("subjects"), []);
+    const pExams = safe(CA.store.get("exams"), []);
+    const pMembers = safe(CA.store.get("members"), []);
+    return Promise.all([pScores, pSubjects, pExams, pMembers]).then(function (arr) {
+      state.scores = arr[0] || [];
+      state.subjects = (arr[1] || []).slice().sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
+      state.exams = (arr[2] || []).slice().sort(function (a, b) { return String(a.date || "").localeCompare(String(b.date || "")); });
+      state.members = (arr[3] || []).slice().sort(function (a, b) { return String(a.studentNo || "").localeCompare(String(b.studentNo || "")); });
+    });
+  }
+
+  // 仅刷新成绩缓存（写操作后调用）
+  function reloadScores() {
+    return safe(CA.store.get("scores"), state.scores || []).then(function (arr) {
+      state.scores = arr || [];
+    });
+  }
+
+  function loadIdentity() {
+    if (CA.auth && typeof CA.auth.current === "function") return Promise.resolve(CA.auth.current());
+    return Promise.resolve(null);
+  }
+
+  function resolveRole(me) {
+    let r = me && me.role;
+    if (!r && CA.app && typeof CA.app.role === "function") {
+      try { r = CA.app.role(); } catch (e) { r = ""; }
+    }
+    // 数据的角色取值是 member|admin|superAdmin；member 归一为学生视角
+    return (r === "student" || r === "member") ? "student" : "admin";
+  }
+
+  // ============================================================
+  // 加载态 / 错误态
+  // ============================================================
+  function renderLoading() {
+    const root = state.root;
+    if (!root) return;
+    root.innerHTML = "";
+    const box = h("div", { class: "scores-view" });
+    box.appendChild(h("div", { class: "card" }, [
+      h("div", { class: "card-head" }, [
+        h("div", { class: "card-title" }, [iconSpan("chart", 20), h("span", { text: "成绩中心" })]),
+      ]),
+      h("div", { class: "skeleton-card", role: "status", "aria-live": "polite" }, [
+        h("div", { class: "ai-loading" }, [h("span", { class: "spinner" }), h("span", { text: "正在加载成绩数据…" })]),
+        h("div", { class: "skeleton" }),
+        h("div", { class: "skeleton" }),
+        h("div", { class: "skeleton short" }),
+      ]),
+    ]));
+    root.appendChild(box);
+  }
+
+  function renderError(err) {
+    const root = state.root;
+    if (!root) return;
+    root.innerHTML = "";
+    const box = h("div", { class: "scores-view" });
+    const card = h("div", { class: "card" });
+    card.innerHTML = emptyHtml("alert", "加载失败", (err && err.message) || "无法加载成绩数据，请稍后重试。");
+    const retry = makeBtn({ class: "btn btn-primary", type: "button" }, "refresh", "重新加载");
+    retry.addEventListener("click", function () {
+      setBtnLoading(retry, true, "加载中…");
+      bootstrap().then(function () { /* bootstrap 内部已渲染 */ });
+    });
+    card.appendChild(retry);
+    box.appendChild(card);
+    root.appendChild(box);
   }
 
   // ============================================================
@@ -1298,23 +1518,56 @@ window.CA = window.CA || {};
     stagger(state.root);
   }
 
+  // 异步引导：骨架 → 身份 → 数据 → 渲染（失败进错误态 + toast，不向上抛）
+  function bootstrap() {
+    const token = mountToken;
+    renderLoading();
+    return loadIdentity()
+      .then(function (me) {
+        if (token !== mountToken) return null;
+        state.me = me;
+        state.role = resolveRole(me);
+        return loadAll();
+      })
+      .then(function () {
+        if (token !== mountToken) return;
+        state.memberId = resolveMemberId(state.me);
+        ensureExam();
+        ensureSubject();
+        render();
+      })
+      .catch(function (err) {
+        if (token !== mountToken) return;
+        toast((err && err.message) || "加载成绩失败", "error");
+        renderError(err);
+      });
+  }
+
   function mount(rootEl) {
-    const user = (CA.auth && CA.auth.current && CA.auth.current()) || {};
+    mountToken++;
     state = {
       root: rootEl,
-      role: user.role === "student" ? "student" : "admin",
+      role: "admin",
+      me: null,
       examId: null,
       subjectId: "all",
       selectedMemberId: null,
       memberId: null,
+      subjects: [],
+      exams: [],
+      members: [],
+      scores: [],
       _parsed: null,
       lastComment: "",
+      diagBox: null,
+      planBox: null,
     };
     injectScopedStyles();
-    render();
+    return bootstrap();
   }
 
   function unmount() {
+    mountToken++; // 使在途异步结果失效
     try {
       if (CA.charts && typeof CA.charts.disposeAll === "function") CA.charts.disposeAll();
     } catch (e) { /* 忽略 */ }
@@ -1326,6 +1579,7 @@ window.CA = window.CA || {};
   CA.scores = {
     stats: stats,
     parseImport: parseImport,
+    parseImportText: parseImportText,
     applyImport: applyImport,
   };
 })();

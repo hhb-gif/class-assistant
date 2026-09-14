@@ -1,9 +1,15 @@
-// 复习视图自测（Agent R2）
+// review-view.js 契约/交互测试（CA 原生复习视图 · 复用 RH 引擎）
 // 运行：node docs/test/review_test.mjs（在 class-assistant 目录下）
-// 零依赖：自带极简 DOM 桩 + mock window.RH（parsers/pipeline/storage/sm2/exporter）与 CA.*
-// 覆盖：mount 不抛错、四个子 Tab 切换、上传流程调用链（mock 文件）、要点渲染、练习答题反馈与
-//       recordAnswer 调用、复习统计与到期列表/筛选、资料库列表与打开/删除、导出调用、
-//       AI 关闭联动降级、RH 缺失优雅降级、XSS 转义。
+//
+// 背景：P3 复习重构——弃用 iframe，改为 CA 原生 v4 视图调用 window.RH 引擎（REVIEW.md §1/§2/§3）。
+// 本测试只加载 ../src/review-view.js，并 mock 最小 window.RH 引擎接口与 DOM，验证：
+//   A. CA.views.review = { mount, unmount } 契约；旧 CA.review.* 不暴露
+//   B. mount 后 REVIEW.md §2 全部 DOM id 存在、结构正确（上传区/三阶段进度/子 Tab/各面板）
+//   C. 走上传链路（mock 引擎）：引擎徽标「离线模式」、要点/练习题渲染、进度隐藏
+//   D. AI 关闭降级：pipeline 调用时 RH.llm.ready() 被置为 false（走规则路径）
+//   E. AI 开启：引擎徽标「AI · {model}」、RH.llm.ready() 为 true
+//   F. 复习（SM-2）入口：今日无到期卡片时渲染空态
+//   G. unmount() 不抛错、非法入参不抛错
 import path from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -12,11 +18,9 @@ const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ============================================================
-// 一、极简 DOM 桩（与 collect_test.mjs 同款）
+// 一、极简 DOM 桩（满足 review-view.js 用到的能力）
 // ============================================================
-function camel(name) {
-  return name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-}
+function camel(name) { return name.replace(/-([a-z])/g, (_, c) => c.toUpperCase()); }
 
 class StubEl {
   constructor(tag) {
@@ -25,82 +29,72 @@ class StubEl {
     this.children = [];
     this.parentNode = null;
     this.attributes = {};
-    this.dataset = {};
     this.style = {};
     this._text = "";
-    this._html = null;
+    this._html = "";
     this._listeners = {};
-    this.value = "";
-    this.checked = false;
-    this.disabled = false;
     this.hidden = false;
-    this.selected = false;
+    this.disabled = false;
+    this.checked = false;
+    this.value = "";
     this.files = null;
   }
   get className() { return this.attributes["class"] || ""; }
   set className(v) { this.attributes["class"] = String(v); }
   get id() { return this.attributes["id"] || ""; }
   set id(v) { this.attributes["id"] = String(v); }
-  get firstChild() { return this.children[0] || null; }
+  get firstChild() { return this.children.length ? this.children[0] : null; }
   get textContent() {
     if (this._text) return this._text;
     return this.children.map((c) => c.textContent).join("");
   }
-  set textContent(v) { this._text = String(v); this.children = []; this._html = null; }
-  get innerHTML() { return this._html != null ? this._html : ""; }
-  set innerHTML(v) { this._html = String(v); this._text = ""; this.children = []; }
-  appendChild(c) {
-    if (c.parentNode) c.parentNode.removeChild(c);
-    c.parentNode = this;
-    this.children.push(c);
-    return c;
+  set textContent(v) { this._text = String(v); this.children = []; }
+  get innerHTML() { return this._html; }
+  set innerHTML(v) { this._html = String(v); if (v === "") this.children = []; }
+  get classList() {
+    const self = this;
+    const list = () => String(self.className).split(/\s+/).filter(Boolean);
+    return {
+      add(...names) { const s = list(); names.forEach((n) => { if (s.indexOf(n) < 0) s.push(n); }); self.className = s.join(" "); },
+      remove(...names) { self.className = list().filter((n) => names.indexOf(n) < 0).join(" "); },
+      toggle(n, force) { const has = list().indexOf(n) >= 0; const on = force === undefined ? !has : !!force; if (on) this.add(n); else this.remove(n); return on; },
+      contains(n) { return list().indexOf(n) >= 0; }
+    };
   }
-  removeChild(c) {
-    const i = this.children.indexOf(c);
-    if (i >= 0) { this.children.splice(i, 1); c.parentNode = null; }
-    return c;
-  }
+  appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.children.push(c); return c; }
+  removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) { this.children.splice(i, 1); c.parentNode = null; } return c; }
   setAttribute(k, v) {
     if (k === "class") this.className = v;
     else if (k === "id") this.id = v;
-    else if (k.indexOf("data-") === 0) this.dataset[camel(k.slice(5))] = String(v);
     else this.attributes[k] = String(v);
   }
   getAttribute(k) {
     if (k === "class") return this.className;
     if (k === "id") return this.id;
-    if (k.indexOf("data-") === 0) {
-      const key = camel(k.slice(5));
-      return this.dataset[key] != null ? this.dataset[key] : null;
-    }
     return this.attributes[k] != null ? this.attributes[k] : null;
   }
   hasAttribute(k) { return this.getAttribute(k) != null; }
-  removeAttribute(k) { delete this.attributes[k]; }
   addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
   removeEventListener(type, fn) {
-    const l = this._listeners[type]; if (!l) return;
-    const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1);
+    const arr = this._listeners[type]; if (!arr) return;
+    const i = arr.indexOf(fn); if (i >= 0) arr.splice(i, 1);
   }
-  focus() { this._focused = true; }
-  blur() {}
-  click() { dispatch(this, { type: "click" }); }
-  closest(sel) {
-    let node = this;
-    while (node) { if (matchesSimple(node, sel)) return node; node = node.parentNode; }
-    return null;
+  dispatchEvent(ev) {
+    ev = ev || {};
+    if (!ev.target) ev.target = this;
+    if (typeof ev.preventDefault !== "function") ev.preventDefault = () => {};
+    const arr = this._listeners[ev.type] || [];
+    arr.slice().forEach((fn) => fn(ev));
+    return true;
   }
+  click() { return this.dispatchEvent({ type: "click" }); }
   querySelectorAll(sel) { return queryAll(this, sel); }
   querySelector(sel) { return queryAll(this, sel)[0] || null; }
-  contains(other) {
-    let n = other;
-    while (n) { if (n === this) return true; n = n.parentNode; }
-    return false;
-  }
+  contains(other) { let n = other; while (n) { if (n === this) return true; n = n.parentNode; } return false; }
 }
 
 function parseSimple(sel) {
-  const out = { tag: null, id: null, classes: [], attrs: [] };
+  const out = { tag: null, id: null, classes: [] };
   const m = /^[a-zA-Z*][\w-]*/.exec(sel);
   let i = 0;
   if (m) { out.tag = m[0]; i = m[0].length; }
@@ -108,14 +102,7 @@ function parseSimple(sel) {
     const ch = sel.charAt(i);
     if (ch === "#") { const a = /^#([\w-]+)/.exec(sel.slice(i)); out.id = a[1]; i += a[0].length; }
     else if (ch === ".") { const b = /^\.([\w-]+)/.exec(sel.slice(i)); out.classes.push(b[1]); i += b[0].length; }
-    else if (ch === "[") {
-      const end = sel.indexOf("]", i);
-      const body = sel.slice(i + 1, end);
-      const eq = body.indexOf("=");
-      if (eq < 0) out.attrs.push([body.trim(), null]);
-      else out.attrs.push([body.slice(0, eq).trim(), body.slice(eq + 1).trim().replace(/^["']|["']$/g, "")]);
-      i = end + 1;
-    } else i++;
+    else i++;
   }
   return out;
 }
@@ -126,427 +113,253 @@ function matchesSimple(el, sel) {
   if (s.id && el.id !== s.id) return false;
   const cls = (el.className || "").split(/\s+/);
   for (const c of s.classes) if (cls.indexOf(c) < 0) return false;
-  for (const [name, want] of s.attrs) {
-    let have;
-    if (name === "class") have = el.className;
-    else if (name === "id") have = el.id;
-    else if (name.indexOf("data-") === 0) have = el.dataset[camel(name.slice(5))];
-    else have = el.attributes[name];
-    if (have == null) return false;
-    if (want != null && String(have) !== want) return false;
-  }
   return true;
 }
 function descendants(node, out = []) {
   for (const c of node.children) { out.push(c); descendants(c, out); }
   return out;
 }
-function matchChain(el, parts) {
-  let idx = parts.length - 1;
-  if (!matchesSimple(el, parts[idx])) return false;
-  idx--;
-  let anc = el.parentNode;
-  while (idx >= 0 && anc) {
-    if (matchesSimple(anc, parts[idx])) idx--;
-    anc = anc.parentNode;
-  }
-  return idx < 0;
-}
 function queryAll(root, sel) {
-  const parts = String(sel).trim().split(/\s+/);
-  return descendants(root).filter((el) => matchChain(el, parts));
+  return descendants(root).filter((el) => matchesSimple(el, sel));
 }
-function dispatch(el, event) {
-  const ev = event || {};
-  ev.type = ev.type || "click";
-  ev.target = ev.target || el;
-  ev.preventDefault = ev.preventDefault || function () { this.defaultPrevented = true; };
-  ev.stopPropagation = ev.stopPropagation || function () { this._stopped = true; };
-  let node = el;
-  while (node) {
-    const ls = node._listeners && node._listeners[ev.type];
-    if (ls) for (const fn of ls.slice()) fn.call(node, ev);
-    node = node.parentNode;
-  }
-  return ev;
-}
-const click = (el) => dispatch(el, { type: "click" });
 
-const docRoot = new StubEl("body");
+const body = new StubEl("body");
+const head = new StubEl("head");
+const html = new StubEl("html");
+html.appendChild(head);
+html.appendChild(body);
+
+function documentScan() { return [head, body].concat(descendants(head), descendants(body)); }
+
 const documentStub = {
-  body: docRoot,
-  head: new StubEl("head"),
+  body, head,
+  documentElement: html,
   createElement: (t) => new StubEl(t),
-  getElementById(id) {
-    const all = [docRoot].concat(descendants(docRoot));
-    for (const el of all) if (el.id === id) return el;
-    return null;
-  },
-  querySelector(sel) { return queryAll(docRoot, sel)[0] || null; },
-  querySelectorAll(sel) { return queryAll(docRoot, sel); },
+  getElementById(id) { for (const el of documentScan()) if (el.id === id) return el; return null; },
+  querySelector(sel) { return queryAll(body, sel)[0] || null; },
+  querySelectorAll(sel) { return documentScan().filter((el) => el.nodeType === 1 && matchesSimple(el, sel)); },
   addEventListener() {},
   removeEventListener() {},
 };
 
 // ============================================================
-// 二、global 替身
+// 二、global 替身（window 指向 global，方便 window.RH / window.CA 互访）
 // ============================================================
 global.window = global;
 global.document = documentStub;
-global.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
-global.confirm = () => true;
-global.alert = () => {};
-global.CA = {};
+global.CA = { app: { toast() {} } };
 
-let urlCalls = 0;
-global.URL = {
-  createObjectURL() { urlCalls++; return "blob:mock"; },
-  revokeObjectURL() {},
-};
-
-// ============================================================
-// 三、mock CA.*
-// ============================================================
-CA.iconCalls = [];
-CA.icon = (name) => {
-  CA.iconCalls.push(name);
-  return '<svg class="icon" data-icon="' + name + '"></svg>';
-};
-CA.util = { fmtSmart: (v) => (v ? "SMART" : "—") };
-CA.app = {
-  toasts: [],
-  toast(msg) { this.toasts.push(String(msg)); },
-  openModal() {}, closeModal() {}, rerender() {},
-};
-let aiOn = true;
-CA.ai = { enabled() { return aiOn; } };
-
-// ============================================================
-// 四、mock window.RH
-// ============================================================
-const parseCalls = [];
-const pipelineCalls = [];
-const recordCalls = [];
-const saveCalls = [];
-const getDocCalls = [];
-const exporterCalls = { docx: 0, quiz: 0 };
-let llmReadySeen = null;
-let pipelineResult = null;
-
-const VM = {
-  title: "高等数学第一章",
-  engine: "llm",
-  backend: "test-model",
-  overview: "本章介绍极限的定义与性质。",
-  keywords: ["极限", "连续"],
-  terms: ["导数"],
-  sections: [
-    {
-      title: "极限",
-      points: [
-        { point: "极限的定义：当自变量趋近某值时函数值的走向。", source: "原文片段A", importance: "high" },
-        { point: "例题：用定义证明极限存在。", source: "原文片段B", importance: "medium", kind: "example" },
-      ],
-    },
-  ],
-  quiz: [
-    { qid: "ai1", type: "choice", question: "极限的定义是什么？", options: ["选项A", "选项B", "选项C", "选项D"], answerIndex: 0, answer: "选项A", explanation: "依据定义", source: "原文片段A", difficulty: 1 },
-    { qid: "ai2", type: "choice", question: "第二个问题？", options: ["甲", "乙", "丙", "丁"], answerIndex: 2, answer: "丙", explanation: "解析2", source: "", difficulty: 2 },
-  ],
-  original_sections: [],
-};
-
-const OFFLINE_VM = {
-  title: "离线资料",
-  engine: "rule",
-  backend: "rule/word_overlap",
-  overview: "离线模式生成。",
-  keywords: ["规则"],
-  terms: [],
-  sections: [{ title: "章", points: [{ point: "离线要点", source: "", importance: "" }] }],
-  quiz: [{ qid: "r1", type: "choice", question: "离线题？", options: ["对", "错"], answerIndex: 0, answer: "对", explanation: "e", source: "", difficulty: 1 }],
-  original_sections: [],
-};
-
-const XSS_VM = {
-  title: "<img src=x onerror=alert(1)>",
-  engine: "rule",
-  backend: "",
-  overview: "<script>alert(1)</script>",
-  keywords: ["<img src=x onerror=alert(1)>"],
-  terms: [],
-  sections: [{ title: "章", points: [{ point: "<script>alert(1)</script>", source: "<img src=y onerror=alert(2)>", importance: "low" }] }],
-  quiz: [{ qid: "x1", type: "choice", question: "<img src=x onerror=alert(3)>", options: ["<script>alert(4)</script>", "b"], answerIndex: 0, answer: "<script>alert(4)</script>", explanation: "<img src=x onerror=alert(5)>", source: "", difficulty: 1 }],
-  original_sections: [],
-};
-
-const docRecords = [
-  {
-    title: "高数笔记", time: Date.now(), engine: "llm", backend: "m", overview: "o",
-    keywords: [], terms: [],
-    sections: [{ title: "s", points: [{ point: "p1" }, { point: "p2" }] }],
-    quiz: [{ qid: "q1", type: "choice", question: "Q1", options: ["a", "b"], answerIndex: 0, answer: "a", explanation: "e", source: "" }],
-    original_sections: [],
-  },
-  {
-    title: "英语笔记", time: Date.now() - 1000, engine: "rule", overview: "", keywords: [], terms: [],
-    sections: [], quiz: [], original_sections: [],
-  },
-];
+// ---- mock 引擎状态 ----
+let aiOn = false;
+let rhLlmReady = true;
+const captured = {};   // { llmReadyAtCall }
 
 function makeRH() {
+  const ruleVm = () => ({
+    title: "测试文档", engine: "rule", backend: "rule/word_overlap",
+    overview: "", keywords: ["测试"], terms: [],
+    sections: [{ title: "第一章", points: [{ point: "要点一", source: "定义：测试要点一。", importance: "high" }] }],
+    quiz: [{ qid: "r1", type: "choice", question: "题干？", options: ["甲", "乙", "丙", "丁"], answerIndex: 0, answer: "甲", explanation: "因为甲", difficulty: 1 }],
+    original_sections: [{ title: "第一章", blocks: ["定义：测试要点一。"], rich: null }]
+  });
+  const llmVm = () => {
+    const vm = ruleVm();
+    vm.engine = "llm"; vm.backend = "deepseek-v4-flash"; vm.overview = "全文总览";
+    vm.quiz = [{ qid: "ai1", type: "choice", question: "题干？", options: ["甲", "乙", "丙", "丁"], answerIndex: 0, answer: "甲", explanation: "因为甲", difficulty: 2 }];
+    return vm;
+  };
   return {
+    llm: {
+      ready() { return rhLlmReady; },
+      info() { return { model: "deepseek-v4-flash" }; }
+    },
     parsers: {
       parseFile(file, onProgress) {
-        parseCalls.push(file);
-        if (onProgress) onProgress("解析", 0.3);
+        if (onProgress) onProgress("已解析", 1);
         return Promise.resolve({
-          title: file.name.replace(/\.[^.]+$/, ""),
-          sections: [{ title: "章", blocks: ["内容"], rich: [{ t: "内容", k: "para", lvl: 0 }] }],
+          title: "测试文档",
+          sections: [{ title: "第一章", blocks: ["定义：测试要点一。", "测试要点二。"], rich: null }]
         });
-      },
+      }
     },
     pipeline: {
       run(doc, onProgress) {
-        pipelineCalls.push(doc);
-        llmReadySeen = (typeof RH !== "undefined" && RH.llm && RH.llm.ready) ? RH.llm.ready() : null;
-        if (onProgress) {
-          onProgress("summarize", "提炼中", 0.5);
-          onProgress("quiz", "出题中", 0.8);
-        }
-        const useLlm = (typeof RH !== "undefined" && RH.llm && RH.llm.ready) ? RH.llm.ready() : true;
-        return Promise.resolve(useLlm ? pipelineResult : OFFLINE_VM);
-      },
+        captured.llmReadyAtCall = window.RH.llm.ready();
+        if (onProgress) onProgress("summarize", "提炼完成", 0.9);
+        return Promise.resolve(aiOn ? llmVm() : ruleVm());
+      }
     },
     storage: {
-      recordAnswer(docTitle, q, ok, userAnswer) {
-        recordCalls.push({ docTitle, qid: q.qid, ok, userAnswer });
-        return Promise.resolve({ cardId: docTitle + "::" + q.qid });
-      },
-      getStats() { return Promise.resolve({ total: 5, due: 2, mastered: 3, weak: 1, learning: 1 }); },
-      getDueCards() {
-        return Promise.resolve([
-          { cardId: "c1", docTitle: "高等数学第一章", qid: "ai1", type: "choice", question: "极限的定义是什么？", options: ["选项A", "选项B"], answerIndex: 0, answer: "选项A", explanation: "e", source: "", difficulty: 1, due: 1 },
-          { cardId: "c2", docTitle: "英语笔记", qid: "e1", type: "choice", question: "word?", options: ["甲", "乙"], answerIndex: 1, answer: "乙", explanation: "", source: "", difficulty: 1, due: 1 },
-        ]);
-      },
+      recordAnswer() { return Promise.resolve({}); },
+      getDueCards() { return Promise.resolve([]); },
       getAllCards() { return Promise.resolve([]); },
-      saveDoc(title) { saveCalls.push(title); return Promise.resolve(true); },
-      getDoc(title) {
-        getDocCalls.push(title);
-        const rec = docRecords.filter((r) => r.title === title)[0];
-        return Promise.resolve(rec || null);
-      },
-      listDocs() { return Promise.resolve(docRecords.slice()); },
-      deleteDoc(title) { this._deleted = title; return Promise.resolve(true); },
+      getStats() { return Promise.resolve({ total: 0, due: 0, mastered: 0, weak: 0 }); },
+      saveDoc() { return Promise.resolve(true); },
+      getDoc() { return Promise.resolve(null); },
+      listDocs() { return Promise.resolve([]); },
+      deleteDoc() { return Promise.resolve(true); }
     },
     sm2: {
-      qualityFromResult(ok) { return ok ? 4 : 1; },
       review(card) { return card; },
-      statusOf() { return "learning"; },
+      qualityFromResult(ok) { return ok ? 4 : 1; },
+      statusOf() { return "learning"; }
     },
     exporter: {
-      docxBlob() { exporterCalls.docx++; return Promise.resolve({ size: 1 }); },
-      quizDocxBlob() { exporterCalls.quiz++; return Promise.resolve({ size: 1 }); },
-      filenameDocx(vm) { return vm.title + "_复习要点.docx"; },
-      filenameQuizDocx(vm) { return vm.title + "_自测卷.docx"; },
-      _deleted: null,
-    },
-    llm: { ready() { return true; }, info() { return { model: "test-model" }; } },
+      docxBlob() { return Promise.resolve({}); },
+      quizDocxBlob() { return Promise.resolve({}); },
+      filenameDocx() { return "a.docx"; },
+      filenameQuizDocx() { return "b.docx"; }
+    }
   };
 }
+
 global.RH = makeRH();
+global.CA.store = { settings() { return { aiEnabled: aiOn }; } };
 
 require(path.join(__dirname, "..", "src", "review-view.js"));
 
 // ============================================================
-// 五、断言工具
+// 三、断言工具
 // ============================================================
 let passCount = 0, failCount = 0;
 function ok(cond, msg) {
-  if (cond) { passCount++; console.log("  ✓ " + msg); }
-  else { failCount++; console.error("  ✗ " + msg); throw new Error("断言失败: " + msg); }
+  if (cond) { passCount++; console.log("  \u2713 " + msg); }
+  else { failCount++; console.error("  \u2717 " + msg); throw new Error("断言失败: " + msg); }
 }
-const tick = () => new Promise((r) => setTimeout(r, 0));
-const flush = async () => { for (let i = 0; i < 6; i++) await tick(); };
+function byId(id) { return documentStub.getElementById(id); }
+function flush(ms) { return new Promise((r) => setTimeout(r, ms || 40)); }
 
-const root = document.createElement("section");
-document.body.appendChild(root);
+// app.js 同款结构：#view-root > section#view-review
+const viewRoot = documentStub.createElement("main");
+viewRoot.id = "view-root";
+body.appendChild(viewRoot);
+const section = documentStub.createElement("section");
+section.id = "view-review";
+viewRoot.appendChild(section);
 
-function remount() {
-  CA.views.review.unmount();
-  root.innerHTML = "";
-  CA.views.review.mount(root);
-}
-function tab(key) { return root.querySelectorAll("#review-tabs .seg-item").filter((b) => b.getAttribute("data-tab") === key)[0]; }
-function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(text) >= 0)[0]; }
-function fakeFile(name, text) {
-  return { name, type: "text/plain", arrayBuffer: async () => new ArrayBuffer(0), text: async () => (text || name) };
-}
-function upload(files) {
-  const input = root.querySelector("#review-file-input");
-  input.files = files;
-  dispatch(input, { type: "change" });
-}
+const V = () => global.CA.views.review;
 
-(async () => {
-  console.log("\n== A. 纯函数 ==");
-  const f = CA.review.formatVm({
-    title: "T", engine: "llm", backend: "m",
-    sections: [{ title: "s", points: ["字符串要点", { point: "p2", importance: "bogus" }] }],
-    quiz: [{ type: "choice", question: "Q", options: ["a", "b"], answer: "b" }],
-  });
-  ok(f.engineLabel === "AI · m", "formatVm 引擎徽标 AI · model");
-  ok(f.sections[0].points.length === 2 && f.sections[0].points[0].point === "字符串要点", "字符串要点被归一化");
-  ok(f.sections[0].points[1].importance === "", "非法 importance 置空");
-  ok(f.quiz[0].answerIndex === 1, "缺 answerIndex 时按 answer 文本回填");
-  ok(CA.review.answerState({ options: ["a", "b"], answerIndex: 1 }, 1).correct === true, "answerState 命中");
-  ok(CA.review.answerState({ options: ["a", "b"], answerIndex: 1 }, 0).correct === false, "answerState 未命中");
-  ok(CA.review.answerState({ options: ["a", "b"], answerIndex: 1 }, null).answered === false, "answerState 未作答");
-  ok(CA.review.mergeDocs([{ title: "A", sections: [{ title: "s" }] }, { title: "B", sections: [] }]).sections.length === 1, "mergeDocs 合并章节");
+// §2 DOM id 清单（REVIEW.md）
+const SEC2_IDS = [
+  "review-upload", "review-file-input",
+  "review-progress", "review-progress-bar", "review-progress-text",
+  "review-result", "review-doc-title", "review-engine-badge",
+  "review-tabs", "review-pane-points", "review-pane-quiz", "review-pane-study", "review-pane-library",
+  "review-overview", "review-keywords", "review-sections",
+  "review-quiz-list", "review-quiz-stats",
+  "review-study-stats", "review-due-list", "review-doc-filter",
+  "review-library-list", "review-quiz-import",
+  "review-export-docx", "review-export-quiz"
+];
 
-  console.log("\n== B. mount 与 DOM id ==");
-  remount();
-  [
-    "#review-upload", "#review-file-input", "#review-progress", "#review-progress-bar", "#review-progress-text",
-    "#review-result", "#review-doc-title", "#review-engine-badge", "#review-tabs",
-    "#review-pane-points", "#review-pane-quiz", "#review-pane-study", "#review-pane-library",
-    "#review-overview", "#review-keywords", "#review-sections",
-    "#review-quiz-list", "#review-quiz-stats", "#review-study-stats", "#review-due-list", "#review-doc-filter",
-    "#review-library-list", "#review-quiz-import", "#review-export-docx", "#review-export-quiz",
-  ].forEach((id) => ok(root.querySelector(id) !== null, "存在 " + id));
+async function run() {
+  console.log("\n== A. 契约 ==");
+  ok(global.CA.views && V(), "CA.views.review 已注册");
+  ok(typeof V().mount === "function", "mount 是函数");
+  ok(typeof V().unmount === "function", "unmount 是函数");
+  ok(typeof global.CA.review === "undefined", "旧 CA.review.* 接口未暴露");
+
+  console.log("\n== B. mount：§2 DOM id 全覆盖 ==");
+  await V().mount(section);
   await flush();
-  ok(root.querySelector("#review-doc-filter").querySelectorAll("option").length === 3, "到期资料筛选含 全部 + 2 份资料");
+  SEC2_IDS.forEach((id) => ok(byId(id) !== null, "存在 #" + id));
+  ok(documentStub.getElementById("review-tabs").className.indexOf("segmented") >= 0, "#review-tabs 使用 .segmented");
+  ok(section.contains(byId("review-upload")), "#review-upload 位于视图容器内");
+  ok(byId("review-upload").querySelector(".ca-art-review") !== null, "上传区空态插画 .ca-art-review（empty-review.png）");
+  ok(byId("review-result").contains(byId("review-pane-points")), "要点面板在 #review-result 内");
+  ok(byId("review-result").contains(byId("review-pane-library")), "资料库面板在 #review-result 内");
+  ok(section.querySelector("#ca-review-style") === null,
+    "样式注入到 head（#ca-review-style 不在视图容器内）");
+  const styleCount = documentScan().filter((el) => el.id === "ca-review-style").length;
+  ok(styleCount === 1, "复习专用样式只注入一次（.ca-review-* 前缀，未改 styles.css）");
 
-  console.log("\n== C. 四个子 Tab 切换 ==");
-  ok(tab("points") !== undefined && tab("quiz") !== undefined && tab("study") !== undefined && tab("library") !== undefined, "四个子 Tab 存在");
-  ok(root.querySelector("#review-pane-points").hidden === false, "默认显示要点 pane");
-  click(tab("quiz"));
-  ok(root.querySelector("#review-pane-quiz").hidden === false && root.querySelector("#review-pane-points").hidden === true, "切到练习 pane");
-  click(tab("study"));
-  ok(root.querySelector("#review-pane-study").hidden === false, "切到复习 pane");
-  click(tab("library"));
-  ok(root.querySelector("#review-pane-library").hidden === false, "切到资料库 pane");
-  click(tab("points"));
+  console.log("\n== B2. 信息架构：顶部主卡合框 + 内容卡单框 ==");
+  const mainCard = byId("review-upload").parentNode;
+  ok(/\bcard\b/.test(mainCard.className) && /ca-review-main/.test(mainCard.className),
+    "上传/进度/结果头合并进同一主卡 .card.ca-review-main");
+  ok(mainCard.contains(byId("review-progress")), "进度区在主卡内（无独立卡片）");
+  ok(mainCard.contains(byId("review-doc-title")) && mainCard.contains(byId("review-engine-badge")),
+    "结果头（标题 / 引擎徽标）在主卡内，不再单独套卡");
+  ok(!byId("review-result").contains(byId("review-doc-title")), "结果头不在 #review-result 内（避免卡中卡）");
+  ok(byId("review-result").querySelectorAll(".card").length === 1,
+    "#review-result 内仅一张内容卡（四面板共用一层边框）");
+  ok(section.querySelectorAll(".card").length === 2, "整屏仅 2 张卡片（顶部主卡 + 内容卡）");
 
-  console.log("\n== D. 上传流程调用链（AI 路径） ==");
-  pipelineResult = VM;
-  aiOn = true;
-  upload([fakeFile("notes.txt")]);
-  await flush();
-  ok(parseCalls.length === 1 && parseCalls[0].name === "notes.txt", "调用 RH.parsers.parseFile");
-  ok(pipelineCalls.length === 1, "调用 RH.pipeline.run");
-  ok(saveCalls.indexOf("高等数学第一章") >= 0, "调用 RH.storage.saveDoc 存档");
-  ok(root.querySelector("#review-doc-title").textContent === "高等数学第一章", "结果头显示文档标题");
-  ok(root.querySelector("#review-engine-badge").textContent.indexOf("AI · test-model") >= 0, "引擎徽标显示 AI · {model}");
-  ok(String(root.querySelector("#review-progress-bar").style.width) === "100%", "进度条推进到 100%");
-
-  console.log("\n== E. 要点渲染 ==");
-  ok(root.querySelector("#review-overview").textContent.indexOf("极限的定义与性质") >= 0, "概述卡渲染");
-  ok(root.querySelectorAll("#review-keywords .chip").length === 3, "关键词 + 术语 chips");
-  ok(root.querySelectorAll("#review-sections .ca-review-point").length === 2, "章节要点渲染");
-  ok(root.querySelectorAll('#review-sections [data-importance="high"]').length === 1, "重要度 high 徽标");
-  ok(byText(root.querySelectorAll("#review-sections .badge"), "例") !== undefined, "example 类加「例」徽标");
-  const pt = root.querySelectorAll("#review-sections .ca-review-point")[0];
-  ok(pt.querySelector(".ca-review-source").hidden === true, "要点原文默认收起");
-  click(pt);
-  ok(pt.querySelector(".ca-review-source").hidden === false, "点击要点展开 source 原文");
-
-  console.log("\n== F. 练习答题反馈与 recordAnswer ==");
-  click(tab("quiz"));
-  const qs = root.querySelectorAll("#review-quiz-list .ca-review-q");
-  ok(qs.length === 2, "渲染 2 道练习题");
-  const c1 = qs[0];
-  click(c1.querySelectorAll(".ca-review-opt")[0]);
-  ok(c1.querySelectorAll(".ca-review-opt.is-selected").length === 1, "选项选中态");
-  click(c1.querySelector(".form-actions .btn"));
-  ok(c1.querySelectorAll(".ca-review-opt.is-correct").length === 1, "答对反馈（绿 is-correct）");
-  ok(c1.querySelector(".ca-review-feedback").hidden === false && c1.querySelector(".ca-review-feedback").textContent.indexOf("解析") >= 0, "显示解析");
-  ok(recordCalls.filter((r) => r.qid === "ai1")[0].ok === true, "recordAnswer(ok=true) 被调用");
-
-  const c2 = qs[1];
-  click(c2.querySelectorAll(".ca-review-opt")[0]);
-  click(c2.querySelector(".form-actions .btn"));
-  ok(c2.querySelectorAll(".ca-review-opt.is-wrong").length === 1, "答错反馈（红 is-wrong）");
-  ok(recordCalls.filter((r) => r.qid === "ai2")[0].ok === false, "recordAnswer(ok=false) 被调用");
-  const qStats = root.querySelector("#review-quiz-stats").textContent;
-  ok(qStats.indexOf("已答 2 / 2") >= 0 && qStats.indexOf("50%") >= 0, "练习统计：已答 2/2 正确率 50%（" + qStats + "）");
-
-  console.log("\n== G. 导出调用 ==");
-  click(root.querySelector("#review-export-docx"));
-  await flush();
-  ok(exporterCalls.docx === 1, "docxBlob 被调用");
-  ok(urlCalls >= 1, "下载触发 URL.createObjectURL");
-  click(root.querySelector("#review-export-quiz"));
-  await flush();
-  ok(exporterCalls.quiz === 1, "quizDocxBlob 被调用");
-
-  console.log("\n== H. 复习统计 / 到期列表 / 筛选 ==");
-  click(tab("study"));
-  const statsText = root.querySelector("#review-study-stats").textContent;
-  ok(statsText.indexOf("今日到期") >= 0 && statsText.indexOf("已掌握") >= 0 && statsText.indexOf("薄弱") >= 0, "四项统计渲染");
-  ok(root.querySelectorAll("#review-due-list .ca-review-due").length === 2, "今日到期列表渲染 2 张卡片");
-  const sel = root.querySelector("#review-doc-filter");
-  sel.value = "英语笔记";
-  dispatch(sel, { type: "change" });
-  ok(root.querySelectorAll("#review-due-list .ca-review-due").length === 1, "按资料筛选后仅 1 张");
-  sel.value = "";
-  dispatch(sel, { type: "change" });
-  const dueCard = root.querySelectorAll("#review-due-list .ca-review-due")[0];
-  click(dueCard.querySelectorAll(".ca-review-opt")[0]);
-  click(dueCard.querySelector(".form-actions .btn"));
-  ok(recordCalls.filter((r) => r.docTitle === "高等数学第一章" && r.qid === "ai1").length >= 2, "到期卡片答题写入 recordAnswer");
-
-  console.log("\n== I. 资料库列表 / 打开 / 删除 ==");
-  click(tab("library"));
-  ok(root.querySelectorAll("#review-library-list .list-row").length === 2, "资料库列表渲染 2 条");
-  const row0 = root.querySelector('#review-library-list .list-row[data-doc-title="高数笔记"]');
-  ok(row0 !== null && row0.textContent.indexOf("要点 2 条") >= 0, "列表显示要点数");
-  click(row0.querySelector('[data-act="delete"]'));
-  await flush();
-  ok(global.RH.storage._deleted === "高数笔记", "删除调用 RH.storage.deleteDoc");
-  const row1 = root.querySelector('#review-library-list .list-row[data-doc-title="英语笔记"]');
-  click(row1.querySelector('[data-act="open"]'));
-  await flush();
-  ok(getDocCalls.indexOf("英语笔记") >= 0, "打开调用 RH.storage.getDoc");
-  ok(root.querySelector("#review-doc-title").textContent === "英语笔记", "打开后恢复文档");
-
-  console.log("\n== J. AI 关闭联动（规则降级） ==");
+  console.log("\n== C. 上传链路（AI 关闭 · 规则降级） ==");
   aiOn = false;
-  llmReadySeen = null;
-  upload([fakeFile("offline.txt")]);
-  await flush();
-  ok(llmReadySeen === false, "AI 关闭时 RH.llm.ready 被临时置为 false（走规则降级）");
-  ok(global.RH.llm.ready() === true, "运行结束后恢复 RH.llm.ready");
-  ok(root.querySelector("#review-engine-badge").textContent === "离线模式", "徽标显示「离线模式」");
+  const input = byId("review-file-input");
+  input.files = [{ name: "生物.txt", arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) }];
+  input.dispatchEvent({ type: "change" });
+  await flush(60);
+  ok(captured.llmReadyAtCall === false, "AI 关闭时 pipeline 调用前 RH.llm.ready() 已被置为 false（走规则降级）");
+  ok(byId("review-engine-badge").textContent === "离线模式", "引擎徽标为「离线模式」（实际：" + byId("review-engine-badge").textContent + "）");
+  ok(byId("review-doc-title").textContent.indexOf("测试文档") >= 0, "#review-doc-title 已填充文档标题");
+  ok(byId("review-result").hidden === false, "结果区已显示");
+  ok(byId("review-progress").hidden === true, "三阶段进度条在处理完成后隐藏");
+  ok(byId("review-sections").querySelector("li.ca-review-point") !== null, "要点列表已渲染（.ca-review-point）");
+  const pointLi = byId("review-sections").querySelector("li.ca-review-point");
+  ok(pointLi.querySelector(".badge") !== null, "要点带重要度徽标（.badge，非 emoji）");
+  pointLi.dispatchEvent({ type: "click" });
+  ok(pointLi.querySelector(".ca-review-source") !== null, "点击要点展开原文 source 片段");
+  ok(byId("review-quiz-list").querySelector(".ca-review-quiz-item") !== null, "练习题已渲染（.ca-review-quiz-item）");
+  ok(byId("review-quiz-stats").textContent.indexOf("已答") >= 0, "#review-quiz-stats 显示练习进度");
+  ok(byId("review-pane-points").hidden === false, "默认激活要点面板");
+  ok(byId("review-pane-quiz").hidden === true, "非激活面板隐藏");
+
+  console.log("\n== C2. 子项以分隔线/列表组织，不再套独立卡片 ==");
+  const hasCardCls = (el) => (el.className || "").split(/\s+/).indexOf("card") >= 0;
+  ok(!hasCardCls(byId("review-sections").querySelector("li.ca-review-point")),
+    "要点项 .ca-review-point 无 .card 边框");
+  ok(!hasCardCls(byId("review-quiz-list").querySelector(".ca-review-quiz-item")),
+    "练习项 .ca-review-quiz-item 无 .card 边框");
+  ok(byId("review-study-stats").className.indexOf("ca-review-stats") >= 0,
+    "复习统计改为平铺指标条 .ca-review-stats（非 4 个卡片）");
+  ok(section.querySelectorAll(".card").length === 2, "渲染后整屏仍仅 2 张卡片（无逐项卡片）");
+
+  console.log("\n== D. 练习答题即时反馈 ==");
+  const optBtn = byId("review-quiz-list").querySelector(".ca-review-option");
+  optBtn.dispatchEvent({ type: "click" });
+  const fb = byId("review-quiz-list").querySelector(".ca-review-feedback");
+  ok(fb !== null && fb.hidden === false, "答题后显示反馈区");
+  ok(/ok|bad/.test(fb.className), "反馈区套用 ok/bad 状态类（无硬编码颜色）");
+  ok(byId("review-quiz-stats").textContent.indexOf("已答 1") >= 0, "练习统计更新为已答 1 题");
+
+  console.log("\n== E. 复习（SM-2）入口：无到期卡片 → 空态 ==");
+  byId("review-start-due").dispatchEvent({ type: "click" });
+  await flush(30);
+  ok(byId("review-due-list").querySelector(".empty") !== null, "无到期卡片时 #review-due-list 渲染 .empty 空态");
+  ok(byId("review-study-stats").querySelectorAll(".stat").length === 4, "#review-study-stats 渲染 4 项统计");
+
+  console.log("\n== F. AI 开启：引擎徽标 AI · {model} ==");
   aiOn = true;
-
-  console.log("\n== K. XSS 转义 ==");
-  pipelineResult = XSS_VM;
-  upload([fakeFile("xss.txt")]);
+  V().unmount();
+  await V().mount(section);
   await flush();
-  const titleEl = root.querySelector("#review-doc-title");
-  ok(titleEl.textContent === "<img src=x onerror=alert(1)>", "标题按纯文本渲染");
-  ok(titleEl.querySelectorAll("img").length === 0, "标题未注入 img");
-  ok(root.querySelectorAll("#review-quiz-list img").length === 0, "题目未注入 img");
-  ok(root.querySelectorAll("#review-sections script").length === 0, "要点未注入 script");
-  ok(root.querySelector("#review-sections").textContent.indexOf("<script>alert(1)</script>") >= 0, "要点按纯文本渲染");
+  const input2 = byId("review-file-input");
+  input2.files = [{ name: "生物.txt", arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) }];
+  input2.dispatchEvent({ type: "change" });
+  await flush(60);
+  ok(captured.llmReadyAtCall === true, "AI 开启时 RH.llm.ready() 为 true（走 LLM 主路径）");
+  ok(byId("review-engine-badge").textContent === "AI · deepseek-v4-flash",
+    "引擎徽标为「AI · deepseek-v4-flash」（实际：" + byId("review-engine-badge").textContent + "）");
 
-  console.log("\n== L. RH 缺失优雅降级 ==");
-  delete global.RH;
+  console.log("\n== G. unmount 与非法入参防御 ==");
   let threw = false;
-  try { remount(); } catch (e) { threw = true; console.error(e); }
-  ok(!threw, "RH 缺失时 mount 不抛错");
-  await flush();
-  ok(root.querySelector("#review-engine-badge").textContent.indexOf("未就绪") >= 0, "徽标提示「复习引擎未就绪」");
-  ok(root.querySelector("#review-file-input").disabled === true, "上传输入被禁用");
-  ok(root.querySelectorAll("#review-due-list .empty").length === 1, "到期列表显示空态");
-  ok(root.querySelectorAll("#review-library-list .empty").length === 1, "资料库显示空态");
+  try { V().unmount(); V().unmount(); } catch (e) { threw = true; console.error(e); }
+  ok(!threw, "连续 unmount() 不抛错");
+  let threw2 = false;
+  try { V().mount(null); V().mount(undefined); V().mount({}); } catch (e) { threw2 = true; console.error(e); }
+  ok(!threw2, "mount(null/undefined/{}) 不抛错");
+  let threw3 = false;
+  try { await V().mount(section); await flush(20); V().unmount(); } catch (e) { threw3 = true; console.error(e); }
+  ok(!threw3, "重复 mount → unmount 不抛错");
 
   console.log("\n========================================");
-  console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过 ✅"}`);
+  console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过"}`);
   process.exit(failCount ? 1 : 0);
-})().catch((e) => {
+}
+
+run().catch((e) => {
   console.error("\n测试中断:", (e && e.stack) || e);
   process.exit(1);
 });

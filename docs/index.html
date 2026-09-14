@@ -1,32 +1,36 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="color-scheme" content="light">
   <meta name="description" content="班级管家 · 本地原型（通知 / 成绩 / 收集 / 复习 / 设置）">
-  <title>班级管家 · 高二(3)班演示</title>
+  <title>班级管家</title>
 
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=20260914l">
 
   <!-- ECharts 5（CDN）：加载失败不阻塞页面，charts.js 自动降级为 CSS 条形图 -->
   <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
 
-  <!-- 复习模块：解析与导出依赖（CDN，失败不阻塞页面，功能按需降级） -->
+  <!-- 复习引擎依赖（CDN，与上方 ECharts 同策略；加载失败不阻塞页面，仅对应格式解析/导出不可用）：
+       pdf.js（PDF 解析） + JSZip（DOCX/PPTX 解析与 Word 导出）。 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-  <!-- pdf.js worker（必须在使用前设置） -->
+  <!-- pdf.js worker（必须在解析使用前设置） -->
   <script>if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
 </head>
 <body>
   <!-- ===== 顶栏 ===== -->
   <header id="topbar">
-    <div id="brand">班级管家<span id="brand-sub">高二(3)班演示</span></div>
+    <div id="brand">班级管家<span id="brand-sub"></span></div>
     <div id="topbar-right">
       <label id="ai-toggle-wrap" title="AI 助手开关">
         <input type="checkbox" id="ai-toggle"><span>AI 助手</span>
       </label>
-      <select id="role-switcher" aria-label="切换身份"></select>
+      <!-- 当前登录用户（保留 id=role-switcher 以维持 CONTRACT §6.1 的 DOM id 契约；
+           已由「假身份切换 select」改为「真实身份展示元素」，由 app.js 渲染，登录前隐藏） -->
+      <span id="role-switcher" style="display:none" aria-live="polite"></span>
+      <button type="button" id="btn-logout" class="btn btn-ghost btn-sm" style="display:none">退出登录</button>
     </div>
   </header>
 
@@ -36,6 +40,8 @@
     <button class="nav-item" type="button" data-view="scores">成绩</button>
     <button class="nav-item" type="button" data-view="collect">收集</button>
     <button class="nav-item" type="button" data-view="review">复习</button>
+    <!-- 留言：icons.js 的 NAV 映射未含 messages，这里直接内联 SVG（禁 emoji），hydrateNav 会跳过不重写 -->
+    <button class="nav-item" type="button" data-view="messages"><svg class="icon nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:20px;height:20px"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg><span class="nav-label">留言</span></button>
     <button class="nav-item" type="button" data-view="settings">设置</button>
   </nav>
 
@@ -54,35 +60,45 @@
   <div id="modal-mask" hidden><div id="modal-box" role="dialog" aria-modal="true"></div></div>
 
   <!-- ===== 脚本加载顺序（契约第 2 节，严格依次）：文件缺失时 404 静默 ===== -->
-  <script src="src/config.js"></script>
-  <script src="src/llm.js"></script>
-  <script src="src/store.js"></script>
-  <script src="src/seed.js"></script>
-  <script src="src/auth.js"></script>
-  <script src="src/charts.js"></script>
-  <script src="src/ai.js"></script>
-  <script src="src/icons.js"></script>
-  <script src="src/notices.js"></script>
-  <script src="src/scores.js"></script>
-  <script src="src/collect.js"></script>
-  <!-- 复习能力模块（RH 原样移植，window.RH 命名空间；顺序契约见 REVIEW.md §1.3） -->
-  <script src="src/review/rules.js"></script>
-  <script src="src/review/tokenizer.js"></script>
-  <script src="src/review/newword.js"></script>
-  <script src="src/review/keywords.js"></script>
-  <script src="src/review/textrank.js"></script>
-  <script src="src/review/selection.js"></script>
-  <script src="src/review/semantic.js"></script>
-  <script src="src/review/sm2.js"></script>
-  <script src="src/review/storage.js"></script>
-  <script src="src/review/quiz.js"></script>
-  <script src="src/review/summarize.js"></script>
-  <script src="src/review/quizgen.js"></script>
-  <script src="src/review/llm.js"></script>
-  <script src="src/review/exporter.js"></script>
-  <script src="src/review/parsers.js"></script>
-  <script src="src/review/pipeline.js"></script>
-  <script src="src/review-view.js"></script>
-  <script src="src/app.js"></script>
+  <!-- CloudBase JS SDK v3 全量包（CDN，固定 3.9.3；含 app.rdb() + app.auth）。必须最先加载 -->
+  <script src="https://static.cloudbase.net/cloudbase-js-sdk/3.9.3/cloudbase.full.js"></script>
+  <script src="src/config.js?v=20260914l"></script>
+  <!-- 云端客户端单例（依赖 config.js 与 CDN SDK；须在 store.js/auth.js 之前） -->
+  <script src="src/cloud.js?v=20260914l"></script>
+  <script src="src/llm.js?v=20260914l"></script>
+  <script src="src/store.js?v=20260914l"></script>
+  <script src="src/seed.js?v=20260914l"></script>
+  <script src="src/auth.js?v=20260914l"></script>
+  <script src="src/charts.js?v=20260914l"></script>
+  <script src="src/ai.js?v=20260914l"></script>
+  <script src="src/icons.js?v=20260914l"></script>
+  <script src="src/notices.js?v=20260914l"></script>
+  <script src="src/scores.js?v=20260914l"></script>
+  <!-- 复习引擎（review-helper 模块零改动移植，注册 window.RH；配 config.js 的 RH_CONFIG 别名）：
+       顺序严格依次：rules → tokenizer → newword → keywords → textrank → selection
+       → semantic → sm2 → storage → quiz → summarize → quizgen → llm → exporter → parsers → pipeline -->
+  <script src="src/review/rules.js?v=20260914l"></script>
+  <script src="src/review/tokenizer.js?v=20260914l"></script>
+  <script src="src/review/newword.js?v=20260914l"></script>
+  <script src="src/review/keywords.js?v=20260914l"></script>
+  <script src="src/review/textrank.js?v=20260914l"></script>
+  <script src="src/review/selection.js?v=20260914l"></script>
+  <script src="src/review/semantic.js?v=20260914l"></script>
+  <script src="src/review/sm2.js?v=20260914l"></script>
+  <script src="src/review/storage.js?v=20260914l"></script>
+  <script src="src/review/quiz.js?v=20260914l"></script>
+  <script src="src/review/summarize.js?v=20260914l"></script>
+  <script src="src/review/quizgen.js?v=20260914l"></script>
+  <script src="src/review/llm.js?v=20260914l"></script>
+  <script src="src/review/exporter.js?v=20260914l"></script>
+  <script src="src/review/parsers.js?v=20260914l"></script>
+  <script src="src/review/pipeline.js?v=20260914l"></script>
+  <!-- 复习视图（CA 原生 UI，调用 RH.* 引擎）：注册 CA.views.review，须在 app.js 之前 -->
+  <script src="src/review-view.js?v=20260914l"></script>
+  <!-- 登录壳（登录页 + 强制改密页；依赖 cloud.js/auth.js，须在 app.js 之前） -->
+  <script src="src/login-view.js?v=20260914l"></script>
+  <!-- 留言视图（学生留言 / 老师回复）：注册 CA.views.messages，须在 app.js 之前 -->
+  <script src="src/messages.js?v=20260914l"></script>
+  <script src="src/app.js?v=20260914l"></script>
 </body>
 </html>

@@ -1,14 +1,21 @@
-// review-view.js —— 复习视图（Agent R2）
-// 职责：把 review-helper（RH）的复习能力包装成班级管家的「复习」Tab。
-// 契约：REVIEW.md §2（DOM id）/ §3（功能与交互）/ §4（存储策略）；UI 规范见 DESIGN.md。
-// 对外：CA.views.review = { mount(rootEl), unmount() }
-//       CA.review = { formatVm, answerState, mergeDocs, escapeHtml, importanceClass, importanceLabel, difficultyLabel }（纯函数，便于单测）
-// 依赖：window.RH（parsers/pipeline/storage/sm2/exporter）、CA.icon / CA.util / CA.app / CA.ai
-// 说明：所有 RH 调用都做「缺失/失败」优雅降级，绝不让视图因引擎未就绪而抛错。
+// review-view.js —— 复习视图（CA 原生 UI · 复用 review-helper 引擎）
+// 目标：用班级管家自己的设计系统（DESIGN.md v4）承载复习功能，只复用 RH 的引擎逻辑，
+//       不再整搬 RH 界面（P2 iframe 方案已弃用）。
+// 契约：REVIEW.md §2（DOM id）/ §3（功能链路）/ §4（存储 ca_study）；CONTRACT.md §7（CA.views.review = {mount, unmount}）。
+// 依赖（全部特性探测，缺失时安全降级，绝不抛错阻断视图）：
+//   window.RH.*   引擎：parsers.parseFile / pipeline.run / storage.* / sm2.* / exporter.* / llm.info
+//   CA.util      时间格式化（禁 ISO 直出）·  CA.icon  图标（禁 emoji）·  CA.app.toast  提示
+//   CA.store.settings().aiEnabled  顶栏 AI 开关（关闭时强制走规则降级）
+// 说明：界面与样式均由本模块自建；复习专用样式以 .ca-review-* 前缀在自身 JS 内注入（沿 scores.js/collect.js 做法），
+//       不改 styles.css（避免与配色 Agent 冲突）。颜色一律用 CSS 变量，不硬编码。
 window.CA = window.CA || {};
 
 (function () {
   "use strict";
+
+  var STYLE_ID = "ca-review-style";
+  var state = null;      // 当前挂载状态（{ root, refs, D, ... }）
+  var mountToken = 0;    // 使在途异步结果失效
 
   // ============================================================
   // 基础工具
@@ -19,44 +26,32 @@ window.CA = window.CA || {};
     });
   }
 
-  function toArray(list) {
-    if (!list) return [];
-    if (Array.isArray(list)) return list.slice();
-    var out = [];
-    if (typeof list.length === "number") {
-      for (var i = 0; i < list.length; i++) out.push(list[i]);
-    }
-    return out;
-  }
+  function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
   function toast(msg, type) {
-    try {
-      if (CA.app && typeof CA.app.toast === "function") CA.app.toast(msg, type);
-    } catch (e) { /* 忽略提示失败 */ }
+    try { if (CA.app && typeof CA.app.toast === "function") CA.app.toast(msg, type); } catch (e) { /* 忽略 */ }
   }
 
+  function toastError(err, fallback) {
+    toast((err && err.message) || fallback || "操作失败", "error");
+  }
+
+  // 时间展示：统一走 CA.util（禁 ISO 直出）；CA.util 缺失时给最小兜底
   function fmtSmart(v) {
     try {
       if (CA.util && typeof CA.util.fmtSmart === "function") return CA.util.fmtSmart(v) || "—";
     } catch (e) { /* 落到兜底 */ }
-    return v == null || v === "" ? "—" : String(v);
+    try {
+      var d = new Date(v);
+      if (!isNaN(d.getTime())) {
+        var p = function (n) { return (n < 10 ? "0" : "") + n; };
+        return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+      }
+    } catch (e) { /* 忽略 */ }
+    return v == null ? "—" : String(v);
   }
 
-  function aiEnabled() {
-    try { return !!(CA.ai && typeof CA.ai.enabled === "function" && CA.ai.enabled()); }
-    catch (e) { return false; }
-  }
-
-  function rhRef() {
-    try { return (typeof window !== "undefined" && window.RH) || null; } catch (e) { return null; }
-  }
-
-  function rhReady() {
-    var rh = rhRef();
-    return !!(rh && rh.parsers && rh.pipeline && rh.storage);
-  }
-
-  // 极简 DOM 构造（与 collect.js/scores.js 同款，保证 node 桩可测）
+  // 极简 DOM 构造（与 collect.js / scores.js 同款）
   function h(tag, attrs, kids) {
     var el = document.createElement(tag);
     if (attrs) {
@@ -71,1223 +66,1039 @@ window.CA = window.CA || {};
         else if (k === "checked") { el.checked = !!v; if (v) el.setAttribute("checked", ""); }
         else if (k === "hidden") { el.hidden = !!v; if (v) el.setAttribute("hidden", ""); }
         else if (k === "disabled") { el.disabled = !!v; if (v) el.setAttribute("disabled", ""); }
+        else if (k === "multiple") { el.multiple = true; el.setAttribute("multiple", ""); }
+        else if (k.indexOf("on") === 0 && typeof v === "function") el.addEventListener(k.slice(2), v);
         else el.setAttribute(k, v);
       });
     }
     if (kids != null) {
-      [].concat(kids).forEach(function (c) {
-        if (c != null && c !== false) el.appendChild(c);
-      });
+      [].concat(kids).forEach(function (c) { if (c != null && c !== false) el.appendChild(c); });
     }
     return el;
   }
 
-  // 图标兜底（icons.js 未就位时用内置 SVG，绝不使用 emoji）
+  function addClass(el, name) { if (el && el.className != null) { var s = String(el.className); if (s.split(/\s+/).indexOf(name) < 0) el.className = (s ? s + " " : "") + name; } }
+  function removeClass(el, name) { if (el && el.className != null) el.className = String(el.className).split(/\s+/).filter(function (x) { return x && x !== name; }).join(" "); }
+  function hasClass(el, name) { return !!(el && el.className != null && String(el.className).split(/\s+/).indexOf(name) >= 0); }
+  function clear(el) { if (!el) return; while (el.firstChild) el.removeChild(el.firstChild); }
+
+  // ============================================================
+  // 图标（统一走 CA.icon；缺失时内置线性 SVG 兜底，绝不使用 emoji）
+  // ============================================================
   var FALLBACK_ICONS = {
     book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
     upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
-    trash: '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>',
-    check: '<path d="M20 6 9 17l-5-5"/>',
-    close: '<path d="M18 6 6 18M6 6l12 12"/>',
-    sparkles: '<path d="M12 3l1.9 4.6L18.5 9l-4.6 1.9L12 15l-1.9-4.1L5.5 9l4.6-1.4Z"/><path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9Z"/>',
+    trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+    check: '<polyline points="20 6 9 17 4 12"/>',
+    close: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
     refresh: '<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>',
-    alert: '<path d="M12 9v4M12 17h.01"/><path d="M10.3 3.3 2 18a2 2 0 0 0 1.7 3h16.6A2 2 0 0 0 22 18L13.7 3.3a2 2 0 0 0-3.4 0Z"/>',
-    info: '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+    sparkles: '<path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3z"/>',
     clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
-    link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
-    search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
-    "chevron-right": '<polyline points="9 18 15 12 9 6"/>',
-    file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
+    alert: '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+    star: '<path d="M12 2.5l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.3l-5.8 3.1 1.1-6.5L2.6 9.3l6.5-.9L12 2.5z"/>',
+    info: '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+    "chevron-right": '<polyline points="9 18 15 12 9 6"/>'
   };
 
   function icon(name, size) {
     if (CA.icon && typeof CA.icon === "function") {
       try { return CA.icon(name, size); } catch (e) { /* 落到兜底 */ }
     }
-    var body = FALLBACK_ICONS[name] || FALLBACK_ICONS.info || "";
+    var body = FALLBACK_ICONS[name] || FALLBACK_ICONS.info;
     var px = size || 16;
     return '<svg class="icon" width="' + px + '" height="' + px + '" viewBox="0 0 24 24" fill="none" ' +
       'stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
       body + "</svg>";
   }
 
-  function iconEl(name, size) {
-    return h("span", { class: "icon-wrap", html: icon(name, size) });
-  }
+  function iconEl(name, size) { return h("span", { class: "icon-wrap", html: icon(name, size) }); }
 
   // ============================================================
-  // 纯函数（导出便于单测）
+  // RH 引擎桥接
   // ============================================================
+  function RH() { return window.RH || null; }
 
-  // 归一化管线产物为视图模型（VM）：补默认值、清洗字段、容错旧结构
-  function formatVm(vm) {
-    vm = vm || {};
-    var engine = vm.engine === "llm" ? "llm" : "rule";
-    var backend = vm.backend == null ? "" : String(vm.backend);
-
-    var sections = toArray(vm.sections).map(function (s) {
-      s = s || {};
-      var points = toArray(s.points).map(function (p) {
-        if (typeof p === "string") p = { point: p };
-        p = p || {};
-        var importance = ["high", "medium", "low"].indexOf(p.importance) >= 0 ? p.importance : "";
-        return {
-          point: p.point == null ? "" : String(p.point),
-          source: p.source == null ? "" : String(p.source),
-          importance: importance,
-          kind: p.kind == null ? "" : String(p.kind)
-        };
-      }).filter(function (p) { return !!p.point; });
-      return { title: s.title == null ? "未命名章节" : String(s.title), points: points };
-    }).filter(function (s) { return s.points.length; });
-
-    var quiz = toArray(vm.quiz).map(function (q, i) {
-      if (!q || typeof q !== "object") return null;
-      var options = toArray(q.options).map(function (o) { return o == null ? "" : String(o); });
-      var ai = q.answerIndex != null ? Number(q.answerIndex) : -1;
-      if (!(ai >= 0 && ai < options.length) && q.answer != null) {
-        ai = options.indexOf(String(q.answer));
+  // 顶栏 AI 开关状态（CA.store.settings 同步；取不到时按开启处理）
+  function aiEnabled() {
+    try {
+      if (CA.store && typeof CA.store.settings === "function") {
+        var s = CA.store.settings();
+        return !(s && s.aiEnabled === false);
       }
-      return {
-        qid: q.qid == null ? "q" + (i + 1) : String(q.qid),
-        type: q.type == null ? "choice" : String(q.type),
-        question: q.question == null ? "" : String(q.question),
-        options: options,
-        answerIndex: ai,
-        answer: q.answer == null ? (options[ai] != null ? options[ai] : "") : String(q.answer),
-        explanation: q.explanation == null ? "" : String(q.explanation),
-        source: q.source == null ? "" : String(q.source),
-        difficulty: q.difficulty == null ? 1 : Number(q.difficulty),
-        importance: q.importance == null ? "" : String(q.importance),
-        origin: q.origin == null ? "" : String(q.origin)
-      };
-    }).filter(function (q) { return q && q.question; });
-
-    return {
-      title: vm.title == null ? "未命名资料" : String(vm.title),
-      engine: engine,
-      backend: backend,
-      engineLabel: engine === "llm" ? ("AI · " + (backend || "LLM")) : "离线模式",
-      overview: vm.overview == null ? "" : String(vm.overview),
-      keywords: toArray(vm.keywords).map(function (k) { return String(k); }).filter(function (k) { return k; }),
-      terms: toArray(vm.terms).map(function (t) { return String(t); }).filter(function (t) { return t; }),
-      sections: sections,
-      quiz: quiz,
-      original_sections: vm.original_sections || []
-    };
+    } catch (e) { /* 忽略 */ }
+    return true;
   }
 
-  // 答题判定：返回 { answered, correct, correctIndex, selected }
-  function answerState(q, selectedIndex) {
-    q = q || {};
-    var options = toArray(q.options);
-    var idx = q.answerIndex != null ? Number(q.answerIndex) : -1;
-    if (!(idx >= 0 && idx < options.length) && q.answer != null) {
-      idx = options.map(function (o) { return String(o); }).indexOf(String(q.answer));
-    }
-    var sel = selectedIndex == null ? -1 : Number(selectedIndex);
-    return {
-      answered: sel >= 0,
-      selected: sel,
-      correctIndex: idx,
-      correct: sel >= 0 && idx >= 0 && sel === idx
-    };
-  }
-
-  // 合并多份解析结果（多文件上传）
-  function mergeDocs(docs) {
-    docs = toArray(docs);
-    if (!docs.length) return { title: "未命名", sections: [] };
-    if (docs.length === 1) return docs[0];
-    var sections = [];
-    var ocr = false;
-    docs.forEach(function (d) {
-      if (!d) return;
-      sections = sections.concat(toArray(d.sections));
-      if (d.ocr) ocr = true;
-    });
-    var base = docs[0].title || "未命名";
-    return { title: base + " 等 " + docs.length + " 份", sections: sections, ocr: ocr };
-  }
-
-  function importanceClass(imp) {
-    if (imp === "high") return "badge-important";
-    if (imp === "medium") return "badge-warn";
-    if (imp === "low") return "badge-muted";
-    return "badge-muted";
-  }
-  function importanceLabel(imp) {
-    if (imp === "high") return "高";
-    if (imp === "medium") return "中";
-    if (imp === "low") return "低";
+  // 当前 LLM 模型名（引擎徽标用）
+  function modelName() {
+    try {
+      if (window.RH && RH.llm && typeof RH.llm.info === "function") {
+        var info = RH.llm.info() || {};
+        return info.model || "";
+      }
+    } catch (e) { /* 忽略 */ }
     return "";
   }
-  function difficultyLabel(d) {
-    var n = Number(d);
-    if (n <= 1) return "简单";
-    if (n === 2) return "中等";
-    return "较难";
-  }
-  function stageLabel(stage) {
-    if (stage === "summarize") return "AI 提炼要点";
-    if (stage === "quiz") return "AI 出题";
-    if (stage === "fallback") return "离线模式";
-    return "处理";
-  }
 
-  // ============================================================
-  // 视图状态
-  // ============================================================
-  var state = null;
-  var styleInjected = false;
-
-  function injectStyles() {
-    if (styleInjected) return;
-    styleInjected = true;
-    if (typeof document === "undefined" || !document.createElement) return;
-    var host = document.head || document.body;
-    if (!host || typeof host.appendChild !== "function") return;
-    var css =
-      ".ca-review{display:flex;flex-direction:column;gap:16px}" +
-      ".ca-review .ca-review-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}" +
-      ".ca-review .icon-wrap{display:inline-flex;color:var(--text-3)}" +
-      // 上传区
-      ".ca-review .ca-review-upload{display:flex;flex-direction:column;align-items:center;gap:8px;padding:28px 20px;" +
-      "border:2px dashed var(--border-strong);border-radius:var(--r);background:var(--surface);cursor:pointer;transition:border-color var(--t-fast),background var(--t-fast)}" +
-      ".ca-review .ca-review-upload:hover,.ca-review .ca-review-upload.is-over{border-color:var(--primary);background:var(--primary-soft)}" +
-      ".ca-review .ca-review-upload.is-loading{pointer-events:none;opacity:.6}" +
-      ".ca-review .ca-review-upload .empty-icon{color:var(--primary)}" +
-      ".ca-review .ca-review-upload-formats{font-size:var(--fs-xs);color:var(--text-3)}" +
-      // 进度
-      ".ca-review .ca-review-progress-track{height:8px;border-radius:var(--r-full);background:var(--surface-2);overflow:hidden}" +
-      ".ca-review .ca-review-progress-track>i{display:block;height:100%;width:0;border-radius:var(--r-full);background:var(--primary);transition:width var(--t)}" +
-      ".ca-review #review-progress-text{font-size:var(--fs-sm);color:var(--text-2);margin-top:6px}" +
-      // 要点
-      ".ca-review .ca-review-chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center}" +
-      ".ca-review .ca-review-chips .ca-review-chips-label{font-size:var(--fs-sm);color:var(--text-3);margin-right:2px}" +
-      ".ca-review .ca-review-point{cursor:pointer;display:block}" +
-      ".ca-review .ca-review-point-title{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap}" +
-      ".ca-review .ca-review-point-text{font-size:var(--fs-base);color:var(--text);line-height:1.6;flex:1;min-width:0}" +
-      ".ca-review .ca-review-source{margin-top:8px;padding:8px 10px;border-left:3px solid var(--primary);" +
-      "background:var(--surface-2);border-radius:var(--r-sm);font-size:var(--fs-sm);color:var(--text-2);line-height:1.6}" +
-      // 练习 / 到期卡片
-      ".ca-review .ca-review-q{margin-bottom:0}" +
-      ".ca-review .ca-review-opts{display:flex;flex-direction:column;gap:8px;margin-top:4px}" +
-      ".ca-review .ca-review-opt{display:flex;align-items:center;gap:10px;text-align:left;width:100%;justify-content:flex-start}" +
-      ".ca-review .ca-review-opt-key{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;" +
-      "border-radius:var(--r-full);background:var(--surface-2);font-size:var(--fs-xs);font-weight:600;color:var(--text-2);flex:none}" +
-      ".ca-review .ca-review-opt.is-selected{border-color:var(--primary);background:var(--primary-soft);color:var(--primary-text)}" +
-      ".ca-review .ca-review-opt.is-correct{border-color:var(--success);background:var(--success-soft);color:var(--success-text)}" +
-      ".ca-review .ca-review-opt.is-wrong{border-color:var(--danger);background:var(--danger-soft);color:var(--danger-text)}" +
-      ".ca-review .ca-review-feedback{margin-top:10px;padding:10px 12px;border-radius:var(--r-sm);background:var(--surface-2)}" +
-      ".ca-review .ca-review-verdict{display:flex;align-items:center;gap:6px;font-weight:600;font-size:var(--fs-sm)}" +
-      ".ca-review .ca-review-verdict.ok{color:var(--success-text)}" +
-      ".ca-review .ca-review-verdict.bad{color:var(--danger-text)}" +
-      ".ca-review .ca-review-explain{margin:6px 0 0;font-size:var(--fs-sm);color:var(--text-2);line-height:1.6}" +
-      ".ca-review .ca-review-source-line{margin:4px 0 0;font-size:var(--fs-xs);color:var(--text-3);line-height:1.6}" +
-      // 资料库
-      ".ca-review .ca-review-lib-main{flex:1;min-width:0}" +
-      ".ca-review .ca-review-lib-actions{display:flex;gap:8px;flex:none}" +
-      "@media(max-width:768px){.ca-review .ca-review-lib-actions{flex-direction:column}}" +
-      "@media(prefers-reduced-motion:reduce){.ca-review *{transition:none!important}}";
-    var style = document.createElement("style");
-    style.setAttribute("type", "text/css");
-    style.textContent = css;
-    host.appendChild(style);
-  }
-
-  function setBtnLoading(btn, on) {
-    if (!btn) return;
-    if (on) {
-      btn.className = (btn.className || "").replace(/\s*is-loading/g, "") + " is-loading";
-      btn.disabled = true;
-    } else {
-      btn.className = (btn.className || "").replace(/\s*is-loading/g, "");
-      btn.disabled = false;
-    }
-  }
-
-  function showProgress(ratio, text) {
-    if (!state || !state.progressEl) return;
-    state.progressEl.hidden = false;
-    var r = typeof ratio === "number" && isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
-    if (state.progressBarEl) state.progressBarEl.style.width = Math.round(r * 100) + "%";
-    if (state.progressTextEl) state.progressTextEl.textContent = text || "处理中…";
-  }
-
-  function hideProgress(delay) {
-    if (!state || !state.progressEl) return;
-    var doHide = function () {
-      if (!state || !state.progressEl) return;
-      state.progressEl.hidden = true;
-      if (state.progressBarEl) state.progressBarEl.style.width = "0%";
-    };
-    if (delay && typeof setTimeout === "function") setTimeout(doHide, delay);
-    else doHide();
-  }
-
-  // ============================================================
-  // 子 Tab 切换
-  // ============================================================
-  function setTab(tab) {
-    if (!state) return;
-    state.activeTab = tab;
-    toArray(state.tabEls).forEach(function (b) {
-      var t = b.getAttribute("data-tab");
-      b.className = "seg-item" + (t === tab ? " active" : "");
-    });
-    toArray(state.paneEls).forEach(function (p) {
-      p.hidden = p.getAttribute("data-pane") !== tab;
-    });
-  }
-
-  // ============================================================
-  // 结果头 / 引擎徽标
-  // ============================================================
-  function renderResult() {
-    if (!state) return;
-    var vm = state.vm;
-    if (!vm) {
-      state.resultEl.hidden = true;
-      state.docTitleEl.textContent = "—";
-      setEngineBadge(rhReady() ? "待上传资料" : "复习引擎未就绪", "badge-muted");
-      return;
-    }
-    state.resultEl.hidden = false;
-    state.docTitleEl.textContent = vm.title;
-    if (vm.engine === "llm") setEngineBadge(vm.engineLabel, "badge-ai");
-    else setEngineBadge("离线模式", "badge-muted");
-    if (state.exportDocxEl) state.exportDocxEl.disabled = false;
-    if (state.exportQuizEl) state.exportQuizEl.disabled = !vm.quiz.length;
-  }
-
-  function setEngineBadge(text, cls) {
-    if (!state || !state.engineBadgeEl) return;
-    state.engineBadgeEl.className = "badge " + cls;
-    state.engineBadgeEl.textContent = text || "";
-  }
-
-  // ============================================================
-  // 要点
-  // ============================================================
-  function renderPoints() {
-    if (!state) return;
-    var vm = state.vm;
-    renderOverview(vm);
-    renderKeywords(vm);
-    renderSections(vm);
-  }
-
-  function renderOverview(vm) {
-    var box = state.overviewEl;
-    if (!box) return;
-    box.innerHTML = "";
-    var card = h("div", { class: "card" });
-    card.appendChild(h("div", { class: "card-head" }, [
-      h("div", { class: "card-title" }, [iconEl("info", 16), h("span", { text: "全文速览" })])
-    ]));
-    if (vm && vm.overview) card.appendChild(h("p", { class: "muted", text: vm.overview }));
-    else card.appendChild(h("p", { class: "muted", text: vm ? "本次资料暂无概述。" : "上传资料后，这里会显示 AI 提炼的全文速览。" }));
-    box.appendChild(card);
-  }
-
-  function renderKeywords(vm) {
-    var box = state.keywordsEl;
-    if (!box) return;
-    box.innerHTML = "";
-    var card = h("div", { class: "card" });
-    card.appendChild(h("div", { class: "card-head" }, [
-      h("div", { class: "card-title" }, [iconEl("sparkles", 16), h("span", { text: "关键词与术语" })])
-    ]));
-    if (!vm || (!vm.keywords.length && !vm.terms.length)) {
-      card.appendChild(h("p", { class: "muted", text: "暂无关键词。" }));
-      box.appendChild(card);
-      return;
-    }
-    if (vm.keywords.length) {
-      var row1 = h("div", { class: "ca-review-chips" });
-      vm.keywords.forEach(function (k) { row1.appendChild(h("span", { class: "chip", text: k })); });
-      card.appendChild(row1);
-    }
-    if (vm.terms.length) {
-      var row2 = h("div", { class: "ca-review-chips" });
-      row2.appendChild(h("span", { class: "ca-review-chips-label", text: "术语" }));
-      vm.terms.forEach(function (t) { row2.appendChild(h("span", { class: "chip", title: "术语", text: t })); });
-      card.appendChild(row2);
-    }
-    box.appendChild(card);
-  }
-
-  function renderSections(vm) {
-    var box = state.sectionsEl;
-    if (!box) return;
-    box.innerHTML = "";
-    if (!vm || !vm.sections.length) {
-      box.appendChild(emptyState("暂无要点", vm ? "本次资料未能提炼出章节要点。" : "上传资料后，这里会按章节列出复习要点。", "file"));
-      return;
-    }
-    vm.sections.forEach(function (sec) {
-      var card = h("div", { class: "card" });
-      card.appendChild(h("div", { class: "card-head" }, [
-        h("div", { class: "card-title", text: sec.title }),
-        h("span", { class: "card-sub", text: sec.points.length + " 条" })
-      ]));
-      var list = h("div", { class: "card-list" });
-      sec.points.forEach(function (p) {
-        list.appendChild(pointRow(p));
-      });
-      card.appendChild(list);
-      box.appendChild(card);
-    });
-  }
-
-  function pointRow(p) {
-    var row = h("div", { class: "list-row ca-review-point", role: "button", tabindex: "0" });
-    var main = h("div", { class: "list-main" });
-    var titleRow = h("div", { class: "ca-review-point-title" });
-    if (p.importance) {
-      titleRow.appendChild(h("span", {
-        class: "badge " + importanceClass(p.importance),
-        "data-importance": p.importance,
-        text: importanceLabel(p.importance)
-      }));
-    }
-    if (p.kind === "example") titleRow.appendChild(h("span", { class: "badge badge-cat", text: "例" }));
-    titleRow.appendChild(h("span", { class: "ca-review-point-text", text: p.point }));
-    main.appendChild(titleRow);
-
-    if (p.source) {
-      var src = h("div", { class: "ca-review-source", hidden: true, text: "原文：" + p.source });
-      main.appendChild(src);
-      row.addEventListener("click", function () { src.hidden = !src.hidden; });
-    }
-    row.appendChild(main);
-    return row;
-  }
-
-  // ============================================================
-  // 练习
-  // ============================================================
-  function renderQuiz() {
-    if (!state) return;
-    var list = state.quizListEl;
-    if (!list) return;
-    list.innerHTML = "";
-    state.quizStats = {};
-
-    if (!rhReady()) {
-      updateQuizStats();
-      list.appendChild(emptyState("复习引擎未就绪", "复习模块尚未加载完成，请稍后重试。", "alert"));
-      return;
-    }
-    if (!state.vm) {
-      updateQuizStats();
-      list.appendChild(emptyState("暂无练习", "先在上方上传资料，系统会按要点自动出题。", "file"));
-      return;
-    }
-    if (!state.vm.quiz.length) {
-      updateQuizStats();
-      list.appendChild(emptyState("未生成题目", "本次资料没有生成选择题，可重新上传或导出要点复习。", "file"));
-      return;
-    }
-    state.vm.quiz.forEach(function (q, i) {
-      list.appendChild(quizQuestion(q, i));
-    });
-    updateQuizStats();
-  }
-
-  function updateQuizStats() {
-    if (!state || !state.quizStatsEl) return;
-    var total = state.vm ? state.vm.quiz.length : 0;
-    var answered = 0, correct = 0;
-    Object.keys(state.quizStats || {}).forEach(function (k) {
-      var s = state.quizStats[k];
-      if (s) { answered++; if (s.ok) correct++; }
-    });
-    var rate = answered ? Math.round(correct / answered * 100) : 0;
-    state.quizStatsEl.textContent = "已答 " + answered + " / " + total + " · 正确率 " + rate + "%";
-  }
-
-  // 通用选择题卡片：选项选中 → 提交 → 对错反馈 + 解析 + 出处
-  function quizQuestion(q, index) {
-    var card = h("div", { class: "card ca-review-q", "data-qid": q.qid });
-
-    var head = h("div", { class: "card-head" });
-    head.appendChild(h("div", { class: "card-title", text: (index + 1) + ". " + q.question }));
-    var badges = h("div", { class: "row" });
-    if (q.importance) badges.appendChild(h("span", { class: "badge " + importanceClass(q.importance), text: importanceLabel(q.importance) }));
-    badges.appendChild(h("span", { class: "badge badge-muted", text: difficultyLabel(q.difficulty) }));
-    head.appendChild(badges);
-    card.appendChild(head);
-
-    card.appendChild(optionArea(q, {
-      onSubmit: function (ok, selectedText) {
-        state.quizStats[q.qid] = { ok: ok };
-        updateQuizStats();
-        recordAnswerSafe(state.vm.title, q, ok, selectedText);
-      }
-    }));
-    return card;
-  }
-
-  // 选项区（选中/提交/反馈），返回容器元素
-  function optionArea(q, cfg) {
-    var wrap = h("div", { class: "ca-review-options" });
-    var opts = h("div", { class: "ca-review-opts" });
-    var buttons = [];
-    var selected = -1;
-    var submitted = false;
-
-    toArray(q.options).forEach(function (opt, oi) {
-      var b = h("button", { class: "ca-review-opt btn", type: "button" });
-      b.appendChild(h("span", { class: "ca-review-opt-key", text: String.fromCharCode(65 + oi) }));
-      b.appendChild(h("span", { class: "ca-review-opt-text", text: opt }));
-      b.addEventListener("click", function () {
-        if (submitted) return;
-        selected = oi;
-        buttons.forEach(function (x, j) {
-          x.className = "ca-review-opt btn" + (j === oi ? " is-selected" : "");
-        });
-      });
-      buttons.push(b);
-      opts.appendChild(b);
-    });
-    wrap.appendChild(opts);
-
-    var actions = h("div", { class: "form-actions" });
-    var submit = h("button", { class: "btn btn-primary btn-sm", type: "button", text: "提交答案" });
-    actions.appendChild(submit);
-    wrap.appendChild(actions);
-
-    var feedback = h("div", { class: "ca-review-feedback", hidden: true });
-    wrap.appendChild(feedback);
-
-    submit.addEventListener("click", function () {
-      if (submitted) return;
-      if (selected < 0) { toast("请先选择一个选项", "warn"); return; }
-      submitted = true;
-      var st = answerState(q, selected);
-      buttons.forEach(function (x, j) {
-        var cls = "ca-review-opt btn";
-        if (j === st.correctIndex) cls += " is-correct";
-        else if (j === selected) cls += " is-wrong";
-        x.className = cls;
-        x.disabled = true;
-      });
-      submit.disabled = true;
-      submit.textContent = "已提交";
-
-      feedback.hidden = false;
-      var verdict = h("div", { class: "ca-review-verdict " + (st.correct ? "ok" : "bad") }, [
-        iconEl(st.correct ? "check" : "close", 14),
-        h("span", { text: st.correct ? "回答正确" : "回答错误" })
-      ]);
-      feedback.appendChild(verdict);
-      if (!st.correct && st.correctIndex >= 0 && q.options[st.correctIndex] != null) {
-        feedback.appendChild(h("p", { class: "ca-review-explain", text: "正确答案：" + String.fromCharCode(65 + st.correctIndex) + ". " + q.options[st.correctIndex] }));
-      }
-      if (q.explanation) feedback.appendChild(h("p", { class: "ca-review-explain", text: "解析：" + q.explanation }));
-      if (q.source) feedback.appendChild(h("p", { class: "ca-review-source-line", text: "原文出处：" + q.source }));
-
-      if (cfg && typeof cfg.onSubmit === "function") cfg.onSubmit(st.correct, q.options[selected]);
-    });
-
-    return wrap;
-  }
-
-  function recordAnswerSafe(docTitle, q, ok, userAnswer) {
-    if (!rhReady() || !rhRef().storage || typeof rhRef().storage.recordAnswer !== "function") return;
-    try {
-      var p = rhRef().storage.recordAnswer(docTitle, q, ok, userAnswer);
-      if (p && typeof p.catch === "function") {
-        p.catch(function (e) { toast("记录答题失败：" + ((e && e.message) || e), "error"); });
-      }
-    } catch (e) {
-      toast("记录答题失败：" + ((e && e.message) || e), "error");
-    }
-  }
-
-  // ============================================================
-  // 复习（SM-2）
-  // ============================================================
-  function renderStudyStats(stats) {
-    if (!state || !state.studyStatsEl) return;
-    var s = stats || {};
-    state.studyStatsEl.innerHTML = "";
-    var items = [
-      { label: "全部卡片", value: s.total || 0, cls: "emphasis" },
-      { label: "今日到期", value: s.due || 0, cls: "warn" },
-      { label: "已掌握", value: s.mastered || 0, cls: "success" },
-      { label: "薄弱", value: s.weak || 0, cls: "danger" }
-    ];
-    items.forEach(function (it) {
-      state.studyStatsEl.appendChild(h("div", { class: "stat " + it.cls }, [
-        h("div", { class: "stat-value", text: String(it.value) }),
-        h("div", { class: "stat-label", text: it.label })
-      ]));
-    });
-  }
-
-  function renderDocFilter() {
-    if (!state || !state.docFilterEl) return;
-    var sel = state.docFilterEl;
-    var prev = state.docFilter || "";
-    sel.innerHTML = "";
-    sel.appendChild(h("option", { value: "", text: "全部资料" }));
-    var seen = {};
-    (state.dueCards || []).forEach(function (c) {
-      var t = c.docTitle || "未命名";
-      if (!seen[t]) { seen[t] = 1; sel.appendChild(h("option", { value: t, text: t })); }
-    });
-    sel.value = seen[prev] ? prev : "";
-    state.docFilter = sel.value || "";
-  }
-
-  function renderDueList() {
-    if (!state || !state.dueListEl) return;
-    var list = state.dueListEl;
-    list.innerHTML = "";
-    if (!rhReady()) {
-      list.appendChild(emptyState("复习引擎未就绪", "复习模块尚未加载完成，请稍后重试。", "alert"));
-      return;
-    }
-    var cards = (state.dueCards || []).filter(function (c) {
-      return !state.docFilter || (c.docTitle || "未命名") === state.docFilter;
-    });
-    if (!cards.length) {
-      list.appendChild(emptyState("今日没有到期卡片", "上传资料并练习后，系统会按 SM-2 间隔安排复习。", "book"));
-      return;
-    }
-    cards.forEach(function (c, i) {
-      list.appendChild(dueCard(c, i));
-    });
-  }
-
-  function dueCard(card, index) {
-    var q = {
-      qid: card.qid != null ? card.qid : ("d" + index),
-      type: card.type || "choice",
-      question: card.question || "",
-      options: toArray(card.options),
-      answerIndex: card.answerIndex != null ? card.answerIndex : -1,
-      answer: card.answer != null ? card.answer : "",
-      explanation: card.explanation || "",
-      source: card.source || "",
-      difficulty: card.difficulty || 1
-    };
-    var wrap = h("div", { class: "ca-review-due" });
-    var cardTitle = h("div", { class: "card-head" }, [
-      h("div", { class: "card-title", text: (index + 1) + ". " + q.question }),
-      h("span", { class: "badge badge-cat", text: card.docTitle || "未命名" })
-    ]);
-    var box = h("div", { class: "card ca-review-q" });
-    box.appendChild(cardTitle);
-
-    if (q.options.length >= 2) {
-      box.appendChild(optionArea(q, {
-        onSubmit: function (ok, selectedText) {
-          recordAnswerSafe(card.docTitle || "未命名", q, ok, selectedText);
-          refreshStudySoon();
-        }
-      }));
-    } else {
-      // 非选择题兜底：显示答案 + 自评两张卡
-      box.appendChild(fallbackSelfCheck(card, q, function (ok) {
-        recordAnswerSafe(card.docTitle || "未命名", q, ok, "");
-        refreshStudySoon();
-      }));
-    }
-    wrap.appendChild(box);
-    return wrap;
-  }
-
-  function fallbackSelfCheck(card, q, onGrade) {
-    var wrap = h("div", { class: "ca-review-options" });
-    var ans = h("p", { class: "ca-review-source-line", hidden: true, text: "答案：" + (q.answer || "—") });
-    var actions = h("div", { class: "form-actions" });
-    var show = h("button", { class: "btn btn-sm", type: "button", text: "显示答案" });
-    show.addEventListener("click", function () { ans.hidden = false; });
-    var right = h("button", { class: "btn btn-success btn-sm", type: "button", text: "记住了" });
-    var wrong = h("button", { class: "btn btn-danger btn-sm", type: "button", text: "没记住" });
-    right.addEventListener("click", function () { right.disabled = wrong.disabled = true; onGrade(true); });
-    wrong.addEventListener("click", function () { right.disabled = wrong.disabled = true; onGrade(false); });
-    actions.appendChild(show);
-    actions.appendChild(right);
-    actions.appendChild(wrong);
-    wrap.appendChild(ans);
-    wrap.appendChild(actions);
-    return wrap;
-  }
-
-  function refreshStudySoon() {
-    if (typeof setTimeout === "function") setTimeout(function () { loadStudy(); }, 0);
-  }
-
-  function loadStudy() {
-    if (!state) return Promise.resolve();
-    if (!rhReady()) {
-      renderStudyStats({});
-      renderDueList();
-      return Promise.resolve();
-    }
-    var storage = rhRef().storage;
-    return Promise.resolve()
-      .then(function () { return typeof storage.getStats === "function" ? storage.getStats() : {}; })
-      .then(function (stats) { renderStudyStats(stats); })
-      .catch(function (e) {
-        renderStudyStats({});
-        toast("读取复习统计失败：" + ((e && e.message) || e), "error");
-      })
-      .then(function () { return typeof storage.getDueCards === "function" ? storage.getDueCards() : []; })
-      .then(function (cards) { state.dueCards = toArray(cards); renderDocFilter(); renderDueList(); })
-      .catch(function (e) {
-        state.dueCards = [];
-        renderDocFilter();
-        renderDueList();
-        toast("读取到期卡片失败：" + ((e && e.message) || e), "error");
-      });
-  }
-
-  // ============================================================
-  // 资料库
-  // ============================================================
-  function loadLibrary() {
-    if (!state || !state.libraryListEl) return Promise.resolve();
-    if (!rhReady()) { renderLibraryList([]); return Promise.resolve(); }
-    var storage = rhRef().storage;
-    return Promise.resolve()
-      .then(function () { return typeof storage.listDocs === "function" ? storage.listDocs() : []; })
-      .then(function (docs) { state.docs = toArray(docs); renderLibraryList(state.docs); })
-      .catch(function (e) {
-        state.docs = [];
-        renderLibraryList([]);
-        toast("读取资料库失败：" + ((e && e.message) || e), "error");
-      });
-  }
-
-  function docCounts(rec) {
-    var points = 0;
-    toArray(rec && rec.sections).forEach(function (s) { points += toArray(s && s.points).length; });
-    return { points: points, quiz: toArray(rec && rec.quiz).length };
-  }
-
-  function renderLibraryList(docs) {
-    var list = state.libraryListEl;
-    if (!list) return;
-    list.innerHTML = "";
-    if (!rhReady()) {
-      list.appendChild(emptyState("复习引擎未就绪", "复习模块尚未加载完成，请稍后重试。", "alert"));
-      return;
-    }
-    docs = toArray(docs);
-    if (!docs.length) {
-      list.appendChild(emptyState("资料库为空", "上传资料后，会自动存档在这里，可随时打开或删除。", "book"));
-      return;
-    }
-    docs.forEach(function (rec) { list.appendChild(libraryRow(rec)); });
-  }
-
-  function libraryRow(rec) {
-    var counts = docCounts(rec);
-    var row = h("div", { class: "list-row", "data-doc-title": rec.title || "" });
-    var main = h("div", { class: "ca-review-lib-main" });
-    main.appendChild(h("div", { class: "list-title" }, [
-      h("span", { class: "list-title-text", text: rec.title || "未命名" })
-    ]));
-    var meta = h("div", { class: "list-meta" });
-    meta.appendChild(iconEl("clock", 13));
-    meta.appendChild(h("span", { text: fmtSmart(new Date(rec.time || Date.now())) }));
-    meta.appendChild(h("span", { text: "·" }));
-    meta.appendChild(h("span", { text: "要点 " + counts.points + " 条" }));
-    meta.appendChild(h("span", { text: "·" }));
-    meta.appendChild(h("span", { text: "题目 " + counts.quiz + " 道" }));
-    main.appendChild(meta);
-    row.appendChild(main);
-
-    var actions = h("div", { class: "ca-review-lib-actions" });
-    var open = h("button", { class: "btn btn-sm", type: "button", "data-act": "open" }, [iconEl("book", 13), h("span", { text: "打开" })]);
-    open.addEventListener("click", function (ev) {
-      if (ev && ev.stopPropagation) ev.stopPropagation();
-      openLibraryDoc(rec.title);
-    });
-    var del = h("button", { class: "btn btn-danger btn-sm", type: "button", "data-act": "delete" }, [iconEl("trash", 13), h("span", { text: "删除" })]);
-    del.addEventListener("click", function (ev) {
-      if (ev && ev.stopPropagation) ev.stopPropagation();
-      removeLibraryDoc(rec.title);
-    });
-    actions.appendChild(open);
-    actions.appendChild(del);
-    row.appendChild(actions);
-    return row;
-  }
-
-  function openLibraryDoc(title) {
-    if (!rhReady()) { toast("复习引擎未就绪", "error"); return; }
-    var storage = rhRef().storage;
-    Promise.resolve()
-      .then(function () { return typeof storage.getDoc === "function" ? storage.getDoc(title) : null; })
-      .then(function (rec) {
-        if (!rec) { toast("未找到该资料", "error"); return; }
-        state.vm = formatVm({
-          title: rec.title, engine: rec.engine, backend: rec.backend,
-          overview: rec.overview, keywords: rec.keywords, terms: rec.terms,
-          sections: rec.sections, quiz: rec.quiz, original_sections: rec.original_sections
-        });
-        state.sourceBlob = rec.sourceBlob || null;
-        state.sourceName = rec.sourceName || "";
-        renderResult();
-        renderPoints();
-        renderQuiz();
-        setTab("points");
-      })
-      .catch(function (e) { toast("打开失败：" + ((e && e.message) || e), "error"); });
-  }
-
-  function removeLibraryDoc(title) {
-    var okConfirm = true;
-    try {
-      if (typeof window.confirm === "function") okConfirm = window.confirm("确定删除资料「" + title + "」吗？其学习记录不会被删除。");
-    } catch (e) { okConfirm = true; }
-    if (!okConfirm) return;
-    if (!rhReady() || typeof rhRef().storage.deleteDoc !== "function") { toast("复习引擎未就绪", "error"); return; }
-    Promise.resolve()
-      .then(function () { return rhRef().storage.deleteDoc(title); })
-      .then(function () {
-        if (state.vm && state.vm.title === title) {
-          state.vm = null;
-          renderResult();
-          renderPoints();
-          renderQuiz();
-        }
-        toast("已删除资料", "success");
-        return loadLibrary();
-      })
-      .catch(function (e) { toast("删除失败：" + ((e && e.message) || e), "error"); });
-  }
-
-  // ============================================================
-  // 上传 / 解析 / 出题
-  // ============================================================
-  function parseProgressHandler() {
-    return function (a, b) {
-      var text = "解析中…";
-      var r = 0.05;
-      if (typeof b === "number") { text = (a == null ? "解析中…" : String(a)); r = b; }
-      else if (typeof a === "number") { r = a; }
-      else if (a != null) { text = String(a); }
-      showProgress(r, text);
-    };
-  }
-
-  // AI 关闭联动：临时让 RH 管线走规则降级（不修改 R1 文件，运行期安全回滚）
-  function runPipeline(doc, report) {
-    var rh = rhRef();
+  // 跑管线：AI 关闭时临时关闭 RH.llm.ready（等价「AI 不可用」），使 RH.pipeline 走规则降级。
+  // 只动引擎的就绪探测函数、不改 RH 源码，finally 恢复（幂等）。
+  function runPipeline(doc, onProgress) {
+    var rh = RH();
     if (!rh || !rh.pipeline || typeof rh.pipeline.run !== "function") {
-      return Promise.reject(new Error("复习引擎未就绪"));
+      return Promise.reject(new Error("复习引擎未加载（请检查 src/review/** 脚本顺序）"));
     }
     var llm = rh.llm;
+    var restore = null;
     if (!aiEnabled() && llm && typeof llm.ready === "function") {
       var orig = llm.ready;
-      llm.ready = function () { return false; };
-      return Promise.resolve()
-        .then(function () { return rh.pipeline.run(doc, report); })
-        .then(function (vm) { llm.ready = orig; return vm; },
-          function (e) { llm.ready = orig; throw e; });
+      try {
+        llm.ready = function () { return false; };
+        restore = function () { try { llm.ready = orig; } catch (e) { /* 忽略 */ } };
+      } catch (e) { restore = null; }
     }
-    return Promise.resolve().then(function () { return rh.pipeline.run(doc, report); });
-  }
-
-  function onFiles(fileList) {
-    var files = toArray(fileList);
-    if (!files.length) return;
-    if (!rhReady()) { toast("复习引擎未就绪，暂时无法解析", "error"); return; }
-    processFiles(files);
-  }
-
-  function processFiles(files) {
-    var rh = rhRef();
-    setUploadBusy(true);
-    showProgress(0.02, "准备解析…");
-    state.sourceBlob = files[0];
-    state.sourceName = files[0] && files[0].name ? files[0].name : "";
-    state.sourceNames = files.map(function (f) { return f && f.name ? f.name : ""; });
-
-    var docs = [];
-    var chain = Promise.resolve();
-    files.forEach(function (file) {
-      chain = chain.then(function () {
-        showProgress(0.08, "解析中：" + (file && file.name ? file.name : ""));
-        return rh.parsers.parseFile(file, parseProgressHandler());
-      }).then(function (doc) { docs.push(doc); });
-    });
-
-    chain
-      .then(function () {
-        var merged = mergeDocs(docs);
-        showProgress(0.2, "AI 提炼要点中…");
-        return runPipeline(merged, function (stage, msg, ratio) {
-          showProgress(ratio, stageLabel(stage) + "：" + (msg || "处理中…"));
-        });
-      })
-      .then(function (raw) {
-        showProgress(0.95, "整理结果…");
-        state.vm = formatVm(raw);
-        renderResult();
-        renderPoints();
-        renderQuiz();
-        return saveCurrentDoc();
-      })
-      .then(function () { return loadLibrary(); })
-      .then(function () {
-        showProgress(1, "完成");
-        setTab("points");
-        toast("已生成复习要点与练习", "success");
-      })
-      .catch(function (e) {
-        toast("解析失败：" + ((e && e.message) || e), "error");
-      })
-      .then(function () {
-        setUploadBusy(false);
-        hideProgress(600);
-      });
-  }
-
-  function saveCurrentDoc() {
-    if (!rhReady() || !state.vm || typeof rhRef().storage.saveDoc !== "function") return Promise.resolve(false);
-    var vm = state.vm;
-    var payload = {
-      overview: vm.overview, engine: vm.engine, backend: vm.backend,
-      sections: vm.sections, quiz: vm.quiz, keywords: vm.keywords, terms: vm.terms,
-      original_sections: vm.original_sections,
-      sourceBlob: state.sourceBlob || null,
-      sourceName: state.sourceName || "",
-      sourceNames: state.sourceNames || []
-    };
     return Promise.resolve()
-      .then(function () { return rhRef().storage.saveDoc(vm.title, payload); })
-      .catch(function () { return false; });
+      .then(function () { return rh.pipeline.run(doc, onProgress); })
+      .then(function (vm) { if (restore) restore(); return vm; },
+        function (err) { if (restore) restore(); throw err; });
   }
 
-  function setUploadBusy(on) {
-    if (!state) return;
-    state.uploadBusy = !!on;
-    if (state.uploadEl) state.uploadEl.className = "ca-review-upload" + (on ? " is-loading" : "");
-    if (state.fileInputEl) state.fileInputEl.disabled = !!on;
+  function stripExt(name) { return String(name || "").replace(/\.[^.]+$/, "") || "未命名文档"; }
+
+  function fileExt(f) { return ((f && f.name) ? String(f.name).split(".").pop() : "").toLowerCase(); }
+
+  var OK_EXTS = ["pdf", "docx", "doc", "pptx", "ppt", "txt", "md", "png", "jpg", "jpeg", "webp", "bmp"];
+  var ACCEPT = ".pdf,.docx,.doc,.pptx,.ppt,.txt,.md,.png,.jpg,.jpeg,.webp,.bmp";
+
+  // ============================================================
+  // 复习专用样式（模块自注入；只用 CSS 变量，不硬编码颜色）
+  // ============================================================
+  function injectStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+    var css = [
+      "/* 复习视图（CA 原生 v4）：顶部主卡（上传/进度/结果头一体）+ 子 Tab 单一内容卡 · 区块用分隔线组织，不逐项套卡 */",
+      "#view-review { margin-top: 0; }",
+      ".ca-review { display: flex; flex-direction: column; gap: var(--sp-4); }",
+      ".ca-review .icon-wrap { display: inline-flex; align-items: center; color: inherit; }",
+      // 统一隐藏规则：覆盖下方 flex 容器的 display，保证 [hidden] 生效
+      ".ca-review [hidden] { display: none; }",
+      // ---- 顶部主卡：标题 + 结果头 + 上传 + 进度（同一视觉边界） ----
+      ".ca-review-main > .card-head { margin-bottom: var(--sp-3); }",
+      ".ca-review-docbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3);",
+      "  flex-wrap: wrap; padding-bottom: var(--sp-3); margin-bottom: var(--sp-3); border-bottom: 2px solid var(--border); }",
+      ".ca-review-docbar-main { display: flex; align-items: center; gap: 10px; min-width: 0; }",
+      ".ca-review-doc-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+      "  font-size: var(--fs-lg); font-weight: var(--fw-bold); letter-spacing: var(--ls-tight); color: var(--text); }",
+      ".ca-review-actions { justify-content: flex-end; flex: none; }",
+      // 拖放区（唯一虚线边界，不再外套卡片）
+      ".ca-review-upload { border: 2px dashed var(--line); border-radius: var(--r); background: var(--surface-2);",
+      "  padding: 26px 18px; display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center;",
+      "  transition: background var(--t), border-color var(--t), box-shadow var(--t); }",
+      ".ca-review-upload.is-drag { background: var(--primary-soft); border-color: var(--primary); box-shadow: var(--shadow-sm); }",
+      ".ca-review-upload .empty-icon { margin-bottom: 2px; }",
+      ".ca-review-hint { font-size: var(--fs-sm); color: var(--text-3); }",
+      // 进度：主卡内子块（顶部一条分隔线，无独立边框）
+      ".ca-review-progress { margin-top: var(--sp-4); padding-top: var(--sp-4); border-top: 2px solid var(--border); }",
+      ".ca-review-progress-text { font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-2); }",
+      ".ca-review-track { height: 14px; border: 2px solid var(--line); border-radius: var(--r-full);",
+      "  background: var(--surface); overflow: hidden; margin-top: 10px; }",
+      ".ca-review-bar { display: block; height: 100%; width: 0; background: var(--primary);",
+      "  border-radius: var(--r-full); transition: width var(--t); }",
+      // ---- 结果：子 Tab + 单一内容卡 ----
+      ".ca-review-result { display: flex; flex-direction: column; gap: var(--sp-3); }",
+      "#review-tabs { align-self: flex-start; }",
+      ".ca-review-content { padding: var(--sp-5); }",
+      ".review-pane { display: flex; flex-direction: column; gap: var(--sp-4); }",
+      ".review-pane[hidden] { display: none; }",
+      // ---- 内容区块：留白 + 分隔线，不叠卡片 ----
+      ".ca-review-block { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }",
+      ".ca-review-block + .ca-review-block { border-top: 2px solid var(--border); padding-top: var(--sp-3); }",
+      ".ca-review-block-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }",
+      ".ca-review-block-title { display: flex; align-items: center; gap: 8px; font-size: var(--fs-md);",
+      "  font-weight: var(--fw-bold); letter-spacing: var(--ls-tight); color: var(--text); }",
+      ".ca-review-block-title .icon { color: var(--primary); }",
+      // 要点
+      ".ca-review-overview { margin: 0; font-size: var(--fs-md); line-height: var(--lh-relaxed); color: var(--text-2); }",
+      ".ca-review-chips { display: flex; flex-wrap: wrap; gap: 6px; }",
+      ".ca-review-sections { gap: var(--sp-4); }",
+      ".ca-review-section { border-left: 4px solid var(--primary-line); padding-left: var(--sp-3); min-width: 0; }",
+      ".ca-review-section-title { display: flex; align-items: center; justify-content: space-between; gap: 8px;",
+      "  font-weight: var(--fw-bold); margin-bottom: 6px; }",
+      ".ca-review-points { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }",
+      ".ca-review-point { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; padding: 9px 8px;",
+      "  border-radius: var(--r-sm); cursor: pointer; transition: background var(--t-fast); }",
+      ".ca-review-point + .ca-review-point { border-top: 1px solid var(--border); }",
+      ".ca-review-point:hover { background: var(--surface-2); }",
+      ".ca-review-point-text { flex: 1; min-width: 0; line-height: var(--lh-snug); }",
+      ".ca-review-source { flex-basis: 100%; margin-top: 2px; padding: 8px 10px; border: 2px solid var(--line);",
+      "  border-radius: var(--r-sm); background: var(--surface); color: var(--text-2); font-size: var(--fs-sm);",
+      "  line-height: var(--lh-base); }",
+      // 练习 / 复习题（平铺 + 分隔线，无逐题卡片）
+      ".ca-review-quiz-item { padding: var(--sp-4) 0; }",
+      ".ca-review-quiz-item:first-child { padding-top: 0; }",
+      ".ca-review-quiz-item + .ca-review-quiz-item { border-top: 2px solid var(--border); }",
+      ".ca-review-q-text { font-weight: var(--fw-semibold); line-height: var(--lh-base); margin: 8px 0 10px; }",
+      ".ca-review-options { display: flex; flex-direction: column; gap: 6px; }",
+      ".ca-review-option { justify-content: flex-start; text-align: left; width: 100%; }",
+      ".ca-review-option.selected { border-color: var(--primary); box-shadow: var(--shadow-sm); }",
+      ".ca-review-feedback { margin-top: 10px; padding: 10px 12px; border: 2px solid var(--line);",
+      "  border-radius: var(--r-sm); font-size: var(--fs-sm); line-height: var(--lh-base); }",
+      ".ca-review-feedback.ok { background: var(--success-soft); color: var(--success-text); }",
+      ".ca-review-feedback.bad { background: var(--danger-soft); color: var(--danger-text); }",
+      ".ca-review-feedback[hidden] { display: none; }",
+      // 复习统计：平铺指标条（去掉 4 个卡片）
+      ".ca-review-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-3); }",
+      ".ca-review-stats .stat { padding: 4px 0 4px var(--sp-3); background: transparent; border: 0;",
+      "  border-left: 4px solid var(--primary-line); border-radius: 0; box-shadow: none; }",
+      ".ca-review-stats .stat.emphasis { background: transparent; border-left-color: var(--primary); box-shadow: none; }",
+      ".ca-review-stats .stat.success { border-left-color: var(--success); }",
+      ".ca-review-stats .stat.danger { border-left-color: var(--danger); }",
+      ".ca-review-stats .stat .stat-value { font-size: var(--fs-xl); }",
+      // 资料库：平铺行 + 分隔线
+      ".ca-review-lib-row { display: flex; align-items: center; gap: 12px; padding: var(--sp-3) 0; }",
+      ".ca-review-lib-row + .ca-review-lib-row { border-top: 1px solid var(--border); }",
+      ".ca-review-lib-row .list-main { flex: 1; min-width: 0; }",
+      ".ca-review-lib-row .list-title { font-weight: var(--fw-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+      ".ca-review-lib-row .list-meta { font-size: var(--fs-sm); color: var(--text-3); }",
+      "@media (max-width: 767px) {",
+      "  #review-tabs { align-self: stretch; }",
+      "  .ca-review-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }",
+      "  .ca-review-lib-row { flex-wrap: wrap; }",
+      "}"
+    ].join("\n");
+    var style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
   }
 
   // ============================================================
-  // 导出
+  // DOM 骨架（mount 时同步构建：§2 全部 id 立即存在，异步数据随后填充）
   // ============================================================
-  function onExport(kind) {
-    if (!state || !state.vm) { toast("请先上传资料或打开文档", "warn"); return; }
-    var rh = rhRef();
-    if (!rhReady() || !rh.exporter) { toast("复习引擎未就绪", "error"); return; }
-    var btn = kind === "quiz" ? state.exportQuizEl : state.exportDocxEl;
-    setBtnLoading(btn, true);
-    Promise.resolve()
-      .then(function () {
-        if (kind === "quiz") {
-          return Promise.all([
-            rh.exporter.quizDocxBlob(state.vm),
-            Promise.resolve(rh.exporter.filenameQuizDocx ? rh.exporter.filenameQuizDocx(state.vm) : state.vm.title + "_自测卷.docx")
-          ]);
-        }
-        return Promise.all([
-          rh.exporter.docxBlob(state.vm),
-          Promise.resolve(rh.exporter.filenameDocx ? rh.exporter.filenameDocx(state.vm) : state.vm.title + "_复习要点.docx")
-        ]);
-      })
-      .then(function (res) {
-        downloadBlob(res[0], res[1]);
-        toast("已导出 Word 文档", "success");
-      })
-      .catch(function (e) { toast("导出失败：" + ((e && e.message) || e), "error"); })
-      .then(function () { setBtnLoading(btn, false); });
-  }
-
-  function downloadBlob(blob, filename) {
-    if (!blob) { toast("导出失败：内容为空", "error"); return; }
-    try {
-      if (typeof URL === "undefined" || !URL.createObjectURL) { toast("当前环境不支持下载", "error"); return; }
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url;
-      a.download = filename || "export.docx";
-      document.body.appendChild(a);
-      a.click();
-      if (a.parentNode) a.parentNode.removeChild(a);
-      if (typeof setTimeout === "function") setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) { /* 忽略 */ } }, 1000);
-    } catch (e) { toast("导出失败：" + ((e && e.message) || e), "error"); }
-  }
-
-  // ============================================================
-  // 题库 JSON 导入
-  // ============================================================
-  function importToVm(data, filename) {
-    var title = String(filename || "").replace(/\.[^.]+$/, "") || "导入题库";
-    var quiz = null;
-    if (Array.isArray(data)) quiz = data;
-    else if (data && Array.isArray(data.quiz)) { quiz = data.quiz; if (data.title != null) title = String(data.title); }
-    else if (data && Array.isArray(data.questions)) { quiz = data.questions; if (data.title != null) title = String(data.title); }
-    if (!quiz || !quiz.length) return null;
-    return formatVm({ title: title, engine: "rule", sections: [], keywords: [], terms: [], quiz: quiz });
-  }
-
-  function readFileText(file) {
-    if (file && typeof file.text === "function") return file.text();
-    return new Promise(function (resolve, reject) {
-      if (typeof FileReader === "undefined") { reject(new Error("当前环境不支持读取文件")); return; }
-      var fr = new FileReader();
-      fr.onload = function () { resolve(String(fr.result || "")); };
-      fr.onerror = function () { reject(fr.error || new Error("读取失败")); };
-      fr.readAsText(file);
-    });
-  }
-
-  function onImportQuiz(ev) {
-    var input = ev && ev.target ? ev.target : null;
-    var file = input && input.files && input.files[0];
-    if (!file) return;
-    readFileText(file).then(function (txt) {
-      var data;
-      try { data = JSON.parse(txt); }
-      catch (e) { toast("JSON 解析失败：" + ((e && e.message) || e), "error"); return; }
-      var vm = importToVm(data, file.name);
-      if (!vm) { toast("题库格式不正确：缺少题目数组", "error"); return; }
-      state.vm = vm;
-      renderResult();
-      renderPoints();
-      renderQuiz();
-      setTab("quiz");
-      toast("已导入题库，共 " + vm.quiz.length + " 题", "success");
-    }).catch(function (e) { toast("读取失败：" + ((e && e.message) || e), "error"); });
-    try { if (input) input.value = ""; } catch (e) { /* 忽略 */ }
-  }
-
-  // ============================================================
-  // 空态
-  // ============================================================
-  function emptyState(title, desc, iconName) {
-    var box = h("div", { class: "empty" });
-    box.appendChild(h("div", { class: "empty-icon", html: icon(iconName || "book", 46) }));
-    box.appendChild(h("div", { class: "empty-title", text: title }));
-    box.appendChild(h("p", { class: "empty-desc", text: desc }));
-    return box;
-  }
-
-  // ============================================================
-  // 挂载 / 卸载
-  // ============================================================
-  function mount(rootEl) {
-    injectStyles();
-    state = {
-      root: rootEl,
-      vm: null,
-      activeTab: "points",
-      quizStats: {},
-      dueCards: [],
-      docs: [],
-      docFilter: "",
-      uploadBusy: false,
-      sourceBlob: null,
-      sourceName: "",
-      sourceNames: [],
-      tabEls: [],
-      paneEls: []
-    };
-    rootEl.innerHTML = "";
-
+  function buildSkeleton(rootEl) {
+    var refs = {};
     var wrap = h("div", { class: "ca-review" });
 
-    // --- 标题行 ---
-    var top = h("div", { class: "ca-review-top" });
-    top.appendChild(h("div", { class: "card-title" }, [iconEl("book", 20), h("span", { text: "学习复习" })]));
-    top.appendChild(h("p", { class: "muted", text: "上传资料 → AI 提炼要点并出题 → 练习 → SM-2 间隔复习 → Word 导出。" }));
-    wrap.appendChild(top);
-
-    // --- 上传区 ---
-    var upload = h("div", { class: "ca-review-upload", id: "review-upload", role: "button", tabindex: "0" });
-    state.uploadEl = upload;
-    upload.appendChild(h("div", { class: "empty-icon", html: icon("upload", 40) }));
-    upload.appendChild(h("div", { class: "empty-title", text: "上传资料，自动生成要点与练习" }));
-    upload.appendChild(h("p", { class: "empty-desc", text: "拖拽文件到此处，或点击选择。支持 PDF / Word / PPT / TXT / Markdown / 图片（OCR）。" }));
-    upload.appendChild(h("span", { class: "ca-review-upload-formats", text: "可一次选择多份资料" }));
-
-    var fileInput = h("input", {
-      type: "file", id: "review-file-input", multiple: true, accept: ".pdf,.doc,.docx,.ppt,.pptx,.txt,.md,.png,.jpg,.jpeg,.webp,.bmp", hidden: true
-    });
-    state.fileInputEl = fileInput;
-    upload.appendChild(fileInput);
-
-    upload.addEventListener("click", function () {
-      if (state.uploadBusy) return;
-      if (fileInput.click) fileInput.click();
-    });
-    upload.addEventListener("keydown", function (ev) {
-      if (ev && (ev.key === "Enter" || ev.key === " ")) {
-        if (ev.preventDefault) ev.preventDefault();
-        if (fileInput.click) fileInput.click();
-      }
-    });
-    upload.addEventListener("dragover", function (ev) {
-      if (ev && ev.preventDefault) ev.preventDefault();
-      upload.className = "ca-review-upload is-over";
-    });
-    upload.addEventListener("dragleave", function () {
-      upload.className = "ca-review-upload" + (state.uploadBusy ? " is-loading" : "");
-    });
-    upload.addEventListener("drop", function (ev) {
-      if (ev && ev.preventDefault) ev.preventDefault();
-      upload.className = "ca-review-upload" + (state.uploadBusy ? " is-loading" : "");
-      var files = ev && ev.dataTransfer ? ev.dataTransfer.files : null;
-      onFiles(files);
-    });
-    fileInput.addEventListener("change", function (ev) {
-      var files = (ev && ev.target ? ev.target.files : null);
-      onFiles(files);
-      try { if (ev && ev.target) ev.target.value = ""; } catch (e) { /* 忽略 */ }
-    });
-
-    // 未就绪时禁用上传
-    if (!rhReady()) {
-      fileInput.disabled = true;
-      upload.appendChild(h("p", { class: "field-error", text: "复习引擎未就绪：请确认 RH 模块已加载。" }));
-    }
-    wrap.appendChild(upload);
-
-    // --- 进度 ---
-    var progress = h("div", { class: "card", id: "review-progress", hidden: true });
-    var bar = h("i", { id: "review-progress-bar" });
-    progress.appendChild(h("div", { class: "ca-review-progress-track" }, [bar]));
-    var ptext = h("div", { id: "review-progress-text", text: "准备中…" });
-    progress.appendChild(ptext);
-    state.progressEl = progress;
-    state.progressBarEl = bar;
-    state.progressTextEl = ptext;
-    wrap.appendChild(progress);
-
-    // --- 结果头（文档标题 + 引擎徽标 + 导出） ---
-    var result = h("div", { class: "card", id: "review-result", hidden: true });
-    var rHead = h("div", { class: "card-head" });
-    var badge = h("span", { class: "badge badge-muted", id: "review-engine-badge", text: rhReady() ? "待上传资料" : "复习引擎未就绪" });
-    state.engineBadgeEl = badge;
-    rHead.appendChild(h("div", { class: "card-title" }, [
-      iconEl("file", 18),
-      h("span", { id: "review-doc-title", text: "—" }),
-      badge
+    // ---- 顶部主卡：标题 + 结果头 + 上传 + 进度（同一视觉边界） ----
+    var mainCard = h("div", { class: "card ca-review-main" });
+    mainCard.appendChild(h("div", { class: "card-head" }, [
+      h("div", { class: "card-title" }, [iconEl("book", 20), h("span", { text: "复习" })]),
+      h("span", { class: "badge badge-ai admin-only", text: "AI 增强" })
     ]));
-    var rActions = h("div", { class: "row" });
-    var exDocx = h("button", { class: "btn btn-sm", id: "review-export-docx", type: "button", disabled: true }, [iconEl("download", 14), h("span", { text: "导出要点卷" })]);
-    exDocx.addEventListener("click", function () { onExport("docx"); });
-    var exQuiz = h("button", { class: "btn btn-sm", id: "review-export-quiz", type: "button", disabled: true }, [iconEl("download", 14), h("span", { text: "导出自测卷" })]);
-    exQuiz.addEventListener("click", function () { onExport("quiz"); });
-    rActions.appendChild(exDocx);
-    rActions.appendChild(exQuiz);
-    rHead.appendChild(rActions);
-    result.appendChild(rHead);
-    state.resultEl = result;
-    state.docTitleEl = rHead.querySelector("#review-doc-title");
-    state.exportDocxEl = exDocx;
-    state.exportQuizEl = exQuiz;
-    wrap.appendChild(result);
 
-    // --- 子 Tab ---
+    // 结果头（文档标题 + 引擎徽标 + 导出）：生成前隐藏，与卡内标题共用一层边框
+    var docTitle = h("div", { class: "ca-review-doc-title", id: "review-doc-title", text: "—" });
+    var engineBadge = h("span", { class: "badge badge-muted", id: "review-engine-badge", text: "离线模式" });
+    var exportDocx = h("button", { class: "btn btn-sm", type: "button", id: "review-export-docx" }, [iconEl("download", 15), h("span", { text: "导出要点" })]);
+    var exportQuiz = h("button", { class: "btn btn-sm", type: "button", id: "review-export-quiz" }, [iconEl("download", 15), h("span", { text: "导出试题" })]);
+    var docbar = h("div", { class: "ca-review-docbar", hidden: true }, [
+      h("div", { class: "ca-review-docbar-main" }, [docTitle, engineBadge]),
+      h("div", { class: "row ca-review-actions" }, [exportDocx, exportQuiz])
+    ]);
+    mainCard.appendChild(docbar);
+
+    var drop = h("div", { class: "ca-review-upload", id: "review-upload" });
+    drop.appendChild(h("div", { class: "empty-icon ca-art ca-art-review", "aria-hidden": "true" }));
+    drop.appendChild(h("div", { class: "empty-title", text: "上传资料，生成复习要点与练习" }));
+    drop.appendChild(h("p", { class: "empty-desc", text: "支持 PDF / Word / PPT / TXT / Markdown / 图片（OCR）。可拖放或点击选择，支持多文件。" }));
+    var pickBtn = h("button", { class: "btn btn-primary", type: "button" }, [iconEl("upload", 16), h("span", { text: "选择文件" })]);
+    drop.appendChild(pickBtn);
+    drop.appendChild(h("div", { class: "ca-review-hint", text: "AI 关闭时自动走离线规则引擎，要点与出题照常可用。" }));
+    var fileInput = h("input", { type: "file", id: "review-file-input", accept: ACCEPT, multiple: true, hidden: true });
+    drop.appendChild(fileInput);
+    refs.upload = drop;
+    refs.fileInput = fileInput;
+    refs.pickBtn = pickBtn;
+    mainCard.appendChild(drop);
+
+    // 进度：主卡内子块（一条分隔线，无独立卡片）
+    var progText = h("div", { class: "ca-review-progress-text", id: "review-progress-text", text: "准备中…" });
+    var progBar = h("i", { class: "ca-review-bar", id: "review-progress-bar" });
+    var progBlock = h("div", { class: "ca-review-progress", id: "review-progress", hidden: true }, [
+      h("div", { class: "row-between" }, [progText, h("span", { class: "badge badge-muted", text: "处理中" })]),
+      h("div", { class: "ca-review-track" }, [progBar])
+    ]);
+    refs.progress = progBlock;
+    refs.progText = progText;
+    refs.progBar = progBar;
+    mainCard.appendChild(progBlock);
+
+    wrap.appendChild(mainCard);
+
+    // ---- 结果区：子 Tab + 单一内容卡 ----
+    var result = h("div", { class: "ca-review-result", id: "review-result", hidden: true });
+
+    // 子 Tab
     var tabs = h("div", { class: "segmented", id: "review-tabs" });
-    var tabDefs = [
+    var PANES = [
       { key: "points", label: "要点" },
       { key: "quiz", label: "练习" },
       { key: "study", label: "复习" },
       { key: "library", label: "资料库" }
     ];
-    tabDefs.forEach(function (t) {
-      var item = h("button", { class: "seg-item" + (t.key === "points" ? " active" : ""), type: "button", "data-tab": t.key, text: t.label });
-      item.addEventListener("click", function () { setTab(t.key); });
-      tabs.appendChild(item);
-      state.tabEls.push(item);
+    var paneEls = {};
+    PANES.forEach(function (p, i) {
+      var btn = h("button", { class: "seg-item" + (i === 0 ? " active" : ""), type: "button", "data-pane": p.key, text: p.label });
+      btn.addEventListener("click", function () { switchPane(p.key); });
+      tabs.appendChild(btn);
+      paneEls[p.key] = btn;
     });
-    wrap.appendChild(tabs);
+    result.appendChild(tabs);
 
-    // --- 要点 pane ---
-    var panePoints = h("div", { class: "stack", id: "review-pane-points", "data-pane": "points" });
-    state.overviewEl = h("div", { id: "review-overview" });
-    state.keywordsEl = h("div", { id: "review-keywords" });
-    state.sectionsEl = h("div", { class: "stack", id: "review-sections" });
-    panePoints.appendChild(state.overviewEl);
-    panePoints.appendChild(state.keywordsEl);
-    panePoints.appendChild(state.sectionsEl);
-    state.paneEls.push(panePoints);
-    wrap.appendChild(panePoints);
+    // 内容卡：四个子 Tab 面板共用一层边框
+    var content = h("div", { class: "card ca-review-content" });
 
-    // --- 练习 pane ---
-    var paneQuiz = h("div", { class: "stack", id: "review-pane-quiz", "data-pane": "quiz", hidden: true });
-    var quizHead = h("div", { class: "card" });
-    quizHead.appendChild(h("div", { class: "card-head" }, [
-      h("div", { class: "card-title" }, [iconEl("check", 16), h("span", { text: "练习进度" })]),
-      h("span", { class: "card-sub", id: "review-quiz-stats", text: "已答 0 / 0 · 正确率 0%" })
-    ]));
-    state.quizStatsEl = quizHead.querySelector("#review-quiz-stats");
-    paneQuiz.appendChild(quizHead);
-    state.quizListEl = h("div", { class: "card-list", id: "review-quiz-list" });
-    paneQuiz.appendChild(state.quizListEl);
-    state.paneEls.push(paneQuiz);
-    wrap.appendChild(paneQuiz);
+    // 要点面板（区块用标题 + 分隔线组织，无逐块卡片）
+    var panePoints = h("div", { class: "review-pane", id: "review-pane-points" });
+    var overview = h("p", { class: "ca-review-overview", id: "review-overview" });
+    var overviewBlock = h("div", { class: "ca-review-block", hidden: true }, [
+      h("div", { class: "ca-review-block-title", text: "全文速览" }),
+      overview
+    ]);
+    var keywords = h("div", { class: "ca-review-chips", id: "review-keywords" });
+    var keywordsBlock = h("div", { class: "ca-review-block", hidden: true }, [
+      h("div", { class: "ca-review-block-title", text: "关键词" }),
+      keywords
+    ]);
+    var sections = h("div", { class: "ca-review-block ca-review-sections", id: "review-sections" });
+    panePoints.appendChild(overviewBlock);
+    panePoints.appendChild(keywordsBlock);
+    panePoints.appendChild(sections);
+    content.appendChild(panePoints);
 
-    // --- 复习 pane ---
-    var paneStudy = h("div", { class: "stack", id: "review-pane-study", "data-pane": "study", hidden: true });
-    state.studyStatsEl = h("div", { class: "stat-grid", id: "review-study-stats" });
-    paneStudy.appendChild(state.studyStatsEl);
-    var studyBar = h("div", { class: "card-head" });
-    studyBar.appendChild(h("div", { class: "card-title" }, [iconEl("refresh", 16), h("span", { text: "今日复习" })]));
-    var studyActions = h("div", { class: "row" });
-    var startBtn = h("button", { class: "btn btn-primary btn-sm", id: "btn-review-start", type: "button" }, [iconEl("refresh", 14), h("span", { text: "开始今日复习" })]);
-    startBtn.addEventListener("click", function () { loadStudy(); toast("已刷新今日到期卡片", "info"); });
-    studyActions.appendChild(startBtn);
-    var docFilter = h("select", { class: "input", id: "review-doc-filter" });
-    docFilter.addEventListener("change", function () {
-      state.docFilter = docFilter.value || "";
-      renderDueList();
-    });
-    state.docFilterEl = docFilter;
-    studyActions.appendChild(docFilter);
-    studyBar.appendChild(studyActions);
-    paneStudy.appendChild(studyBar);
-    state.dueListEl = h("div", { class: "card-list", id: "review-due-list" });
-    paneStudy.appendChild(state.dueListEl);
-    state.paneEls.push(paneStudy);
-    wrap.appendChild(paneStudy);
+    // 练习面板
+    var quizStats = h("div", { class: "ca-review-quiz-stats card-sub", id: "review-quiz-stats", text: "—" });
+    var quizList = h("div", { class: "ca-review-quiz-list", id: "review-quiz-list" });
+    var paneQuiz = h("div", { class: "review-pane", id: "review-pane-quiz", hidden: true }, [
+      h("div", { class: "ca-review-block-head" }, [
+        h("div", { class: "ca-review-block-title", text: "练习" }),
+        quizStats
+      ]),
+      quizList
+    ]);
+    content.appendChild(paneQuiz);
 
-    // --- 资料库 pane ---
-    var paneLibrary = h("div", { class: "stack", id: "review-pane-library", "data-pane": "library", hidden: true });
-    var libHead = h("div", { class: "card-head" });
-    libHead.appendChild(h("div", { class: "card-title" }, [iconEl("book", 16), h("span", { text: "历史资料" })]));
-    var importWrap = h("label", { class: "btn btn-sm", title: "导入题库 JSON" }, [iconEl("upload", 14), h("span", { text: "导入题库" })]);
-    var importInput = h("input", { type: "file", id: "review-quiz-import", accept: ".json,application/json", hidden: true });
-    state.importInputEl = importInput;
-    importInput.addEventListener("change", onImportQuiz);
-    importWrap.appendChild(importInput);
-    libHead.appendChild(importWrap);
-    paneLibrary.appendChild(libHead);
-    state.libraryListEl = h("div", { class: "card-list", id: "review-library-list" });
-    paneLibrary.appendChild(state.libraryListEl);
-    state.paneEls.push(paneLibrary);
-    wrap.appendChild(paneLibrary);
+    // 复习面板（SM-2）
+    var docFilter = h("select", { class: "input", id: "review-doc-filter" }, [h("option", { value: "", text: "全部资料" })]);
+    var studyStats = h("div", { class: "ca-review-stats", id: "review-study-stats" });
+    var startDue = h("button", { class: "btn btn-primary btn-sm", type: "button", id: "review-start-due" }, [h("span", { text: "开始今日复习" })]);
+    var startAll = h("button", { class: "btn btn-sm", type: "button", id: "review-start-all" }, [h("span", { text: "复习全部" })]);
+    var dueList = h("div", { class: "ca-review-due-list", id: "review-due-list" });
+    var paneStudy = h("div", { class: "review-pane", id: "review-pane-study", hidden: true }, [
+      h("div", { class: "ca-review-block-head" }, [
+        h("div", { class: "ca-review-block-title" }, [iconEl("clock", 18), h("span", { text: "间隔复习" })]),
+        h("div", { class: "row" }, [h("label", { class: "label", text: "资料筛选" }), docFilter])
+      ]),
+      studyStats,
+      h("div", { class: "row ca-review-study-actions" }, [startDue, startAll]),
+      dueList
+    ]);
+    content.appendChild(paneStudy);
 
+    // 资料库面板
+    var importInput = h("input", { type: "file", accept: ".json", hidden: true });
+    var importBtn = h("button", { class: "btn btn-sm", type: "button", id: "review-quiz-import" }, [iconEl("upload", 15), h("span", { text: "导入题库 JSON" })]);
+    var libList = h("div", { class: "ca-review-lib-list", id: "review-library-list" });
+    var paneLib = h("div", { class: "review-pane", id: "review-pane-library", hidden: true }, [
+      h("div", { class: "ca-review-block-head" }, [
+        h("div", { class: "ca-review-block-title", text: "资料库" }),
+        importBtn
+      ]),
+      importInput,
+      libList
+    ]);
+    content.appendChild(paneLib);
+
+    result.appendChild(content);
+
+    wrap.appendChild(result);
     rootEl.appendChild(wrap);
 
-    // 初始渲染 + 异步加载
-    setTab("points");
-    renderResult();
-    renderPoints();
-    renderQuiz();
-    renderStudyStats({});
-    renderDueList();
-    renderLibraryList([]);
-    loadStudy();
-    loadLibrary();
+    return {
+      wrap: wrap,
+      refs: refs,
+      result: result,
+      tabs: tabs,
+      tabBtns: paneEls,
+      panes: {
+        points: panePoints,
+        quiz: paneQuiz,
+        study: paneStudy,
+        library: paneLib
+      },
+      docbar: docbar,
+      overviewBlock: overviewBlock,
+      overview: overview,
+      keywordsBlock: keywordsBlock,
+      keywords: keywords,
+      sections: sections,
+      quizList: quizList,
+      quizStats: quizStats,
+      studyStats: studyStats,
+      dueList: dueList,
+      startDue: startDue,
+      startAll: startAll,
+      docFilter: docFilter,
+      libList: libList,
+      importInput: importInput,
+      importBtn: importBtn,
+      exportDocx: exportDocx,
+      exportQuiz: exportQuiz,
+      docTitle: docTitle,
+      engineBadge: engineBadge
+    };
+  }
+
+  // ============================================================
+  // Tab 切换
+  // ============================================================
+  function switchPane(name) {
+    if (!state || !state.ui) return;
+    state.pane = name;
+    Object.keys(state.ui.panes).forEach(function (k) {
+      var pane = state.ui.panes[k];
+      var btn = state.ui.tabBtns[k];
+      if (pane) pane.hidden = (k !== name);
+      if (btn) btn.className = "seg-item" + (k === name ? " active" : "");
+    });
+    if (name === "study") refreshStudy();
+    if (name === "library") refreshLibrary();
+  }
+
+  // ============================================================
+  // 上传 / 解析 / 管线
+  // ============================================================
+  function setProgress(text, ratio) {
+    if (!state || !state.ui) return;
+    if (state.ui.refs.progText) state.ui.refs.progText.textContent = text || "";
+    if (state.ui.refs.progBar) state.ui.refs.progBar.style.width = Math.round((ratio == null ? 0 : ratio) * 100) + "%";
+  }
+
+  var STAGE_LABEL = { parse: "解析", summarize: "AI 提炼要点", quiz: "AI 出题", fallback: "离线规则引擎" };
+
+  function onProgress(stage, msg, ratio) {
+    var label = STAGE_LABEL[stage] || stage || "处理中";
+    setProgress(msg ? (label + " · " + msg) : label, ratio);
+  }
+
+  function showProgress(on) {
+    if (state && state.ui && state.ui.refs.progress) state.ui.refs.progress.hidden = !on;
+  }
+
+  function asArray(fileList) {
+    if (!fileList) return [];
+    if (typeof fileList.length === "number" && typeof fileList !== "string") {
+      var out = [];
+      for (var i = 0; i < fileList.length; i++) out.push(fileList[i]);
+      return out;
+    }
+    return [fileList];
+  }
+
+  function handleFiles(fileList) {
+    var files = asArray(fileList).filter(function (f) { return f && f.name; });
+    if (!files.length) return Promise.resolve();
+    for (var i = 0; i < files.length; i++) {
+      if (OK_EXTS.indexOf(fileExt(files[i])) < 0) { toast("不支持的格式：." + fileExt(files[i]), "error"); return Promise.resolve(); }
+    }
+    var rh = RH();
+    if (!rh || !rh.parsers || typeof rh.parsers.parseFile !== "function") {
+      toast("复习引擎未加载，无法解析", "error");
+      return Promise.resolve();
+    }
+
+    var token = mountToken;
+    showProgress(true);
+    setProgress("准备中…", 0.02);
+
+    var parsedList = [];
+    var chain = Promise.resolve();
+    files.forEach(function (f, idx) {
+      chain = chain.then(function () {
+        var multi = files.length > 1;
+        return rh.parsers.parseFile(f, function (msg, ratio) {
+          onProgress("parse", multi ? ("第" + (idx + 1) + "/" + files.length + "个 " + f.name + (msg ? " · " + msg : "")) : msg, ratio);
+        });
+      }).then(function (doc) { parsedList.push(doc); });
+    });
+
+    return chain.then(function () {
+      var merged = files.length > 1
+        ? { title: stripExt(files[0].name), sections: parsedList.reduce(function (a, p) { return a.concat(p.sections || []); }, []) }
+        : parsedList[0];
+      setProgress("AI 提炼要点", 0.68);
+      return runPipeline(merged, onProgress).then(function (vm) {
+        return { merged: merged, vm: vm };
+      });
+    }).then(function (r) {
+      if (token !== mountToken || !state) return;   // 已切换/卸载：丢弃过期结果
+      var D = buildD(r.merged, r.vm, files);
+      state.D = D;
+      state.quizAnswered = {};
+      renderResult();
+      showProgress(false);
+      toast("已生成复习要点与练习", "success");
+      var rh2 = RH();
+      if (rh2 && rh2.storage && typeof rh2.storage.saveDoc === "function") {
+        try {
+          rh2.storage.saveDoc(D.title, {
+            backend: D.backend, overview: D.overview, engine: D.engine,
+            sections: D.sections, quiz: D.quiz, keywords: D.keywords, terms: D.terms,
+            original_sections: D.original_sections, markdown: "",
+            sourceBlob: D.sourceBlob, sourceName: D.sourceName, sourceNames: D.sourceNames
+          }).then(function () { if (state && state.D === D) { refreshLibrary(); refreshStudy(); } }).catch(function () { /* 存库失败不阻断 */ });
+        } catch (e) { /* 忽略 */ }
+      }
+    }).catch(function (err) {
+      if (token !== mountToken || !state) return;
+      showProgress(false);
+      setProgress("", 0);
+      toastError(err, "解析失败");
+    });
+  }
+
+  function flattenOriginal(parsed) {
+    return (parsed.sections || []).map(function (s) {
+      return { title: s.title, blocks: s.blocks || [], rich: s.rich || null };
+    });
+  }
+
+  function buildD(parsed, vm, files) {
+    vm = vm || {};
+    parsed = parsed || {};
+    var list = files || [];
+    return {
+      title: vm.title || parsed.title || "未命名文档",
+      engine: vm.engine || "rule",
+      backend: vm.backend || "",
+      overview: vm.overview || "",
+      keywords: vm.keywords || [],
+      terms: vm.terms || [],
+      sections: vm.sections || [],
+      quiz: vm.quiz || [],
+      original_sections: vm.original_sections || flattenOriginal(parsed),
+      sourceBlob: list[0] || null,
+      sourceName: list[0] ? list[0].name : "",
+      sourceNames: list.map(function (f) { return f && f.name; }).filter(Boolean)
+    };
+  }
+
+  // ============================================================
+  // 结果渲染
+  // ============================================================
+  function renderResult() {
+    if (!state || !state.ui || !state.D) return;
+    var ui = state.ui, D = state.D;
+    ui.result.hidden = false;
+    if (ui.docbar) ui.docbar.hidden = false;
+    if (ui.docTitle) ui.docTitle.textContent = D.title + " · 复习";
+    renderEngineBadge();
+
+    // 要点
+    if (ui.overviewBlock) ui.overviewBlock.hidden = !D.overview;
+    if (ui.overview) ui.overview.textContent = D.overview || "";
+    var kws = (D.keywords || []).concat(D.terms || []);
+    if (ui.keywordsBlock) ui.keywordsBlock.hidden = !kws.length;
+    if (ui.keywords) {
+      clear(ui.keywords);
+      kws.forEach(function (k) { ui.keywords.appendChild(h("span", { class: "chip", text: k })); });
+    }
+    renderSections();
+
+    // 练习
+    renderQuiz("review-quiz-list", D.quiz || [], { study: false });
+
+    // 复习统计 / 资料库
+    refreshStudy();
+    refreshLibrary();
+    switchPane(state.pane || "points");
+  }
+
+  function renderEngineBadge() {
+    var badge = state.ui.engineBadge;
+    if (!badge) return;
+    var D = state.D || {};
+    if (D.engine === "llm") {
+      var model = modelName() || D.backend || "LLM";
+      badge.textContent = "AI · " + model;
+      badge.className = "badge badge-ai";
+      badge.title = "AI 主路径（总结 + 出题）";
+    } else if (D.engine === "import") {
+      badge.textContent = "题库导入";
+      badge.className = "badge badge-muted";
+      badge.title = "从 JSON 题库导入";
+    } else {
+      badge.textContent = "离线模式";
+      badge.className = "badge badge-muted";
+      badge.title = "AI 未开启或调用失败，已自动降级本地规则引擎";
+    }
+  }
+
+  function impBadge(importance) {
+    if (importance === "high") return h("span", { class: "badge badge-danger", text: "重点" });
+    if (importance === "medium") return h("span", { class: "badge badge-warn", text: "要点" });
+    if (importance === "low") return h("span", { class: "badge badge-muted", text: "了解" });
+    return null;
+  }
+
+  function renderSections() {
+    var box = state.ui.sections;
+    if (!box) return;
+    clear(box);
+    var sections = (state.D && state.D.sections) || [];
+    if (!sections.length) {
+      box.appendChild(emptyBlock("暂无要点", "本次未提炼出要点，可检查资料内容或重新上传。", null));
+      return;
+    }
+    sections.forEach(function (sec, si) {
+      var points = sec.points || (sec.items || []).map(function (it) { return { point: it, source: "", importance: "" }; });
+      var block = h("div", { class: "ca-review-section" });
+      block.appendChild(h("div", { class: "ca-review-section-title" }, [
+        h("span", { text: sec.title || ("第" + (si + 1) + "章") }),
+        h("span", { class: "muted text-xs", text: points.length + " 条" })
+      ]));
+      var ul = h("ul", { class: "ca-review-points" });
+      points.forEach(function (p) {
+        var pointText = (p && p.point) || "";
+        var li = h("li", { class: "ca-review-point" });
+        var badge = impBadge(p && p.importance);
+        if (badge) li.appendChild(badge);
+        if (p && p.kind === "example") li.appendChild(h("span", { class: "badge badge-outline", text: "例" }));
+        li.appendChild(h("span", { class: "ca-review-point-text", text: pointText }));
+        // 点击要点：展开/收起 source 原文片段（REVIEW.md §3.3 第一版简化定位）
+        var srcBox = null;
+        if (p && p.source) {
+          li.addEventListener("click", function () {
+            if (srcBox && srcBox.parentNode) { li.removeChild(srcBox); srcBox = null; return; }
+            srcBox = h("div", { class: "ca-review-source", text: "原文：" + p.source });
+            li.appendChild(srcBox);
+          });
+          li.title = "点击查看原文片段";
+        }
+        ul.appendChild(li);
+      });
+      block.appendChild(ul);
+      box.appendChild(block);
+    });
+  }
+
+  function emptyBlock(title, desc, art) {
+    var box = h("div", { class: "empty" });
+    if (art) box.appendChild(h("div", { class: "empty-icon ca-art " + art, "aria-hidden": "true" }));
+    box.appendChild(h("div", { class: "empty-title", text: title }));
+    if (desc) box.appendChild(h("p", { class: "empty-desc", text: desc }));
+    return box;
+  }
+
+  // ============================================================
+  // 练习题渲染与答题（练习 / 复习共用）
+  // ============================================================
+  var QTYPE_NAME = { choice: "选择", judge: "判断", cloze: "填空" };
+
+  function renderQuiz(containerId, list, opts) {
+    opts = opts || {};
+    var box = document.getElementById(containerId);
+    if (!box) return;
+    clear(box);
+    if (!list || !list.length) {
+      box.appendChild(opts.study
+        ? emptyBlock("暂无待复习卡片", "练习中答对的题会在 1 天后进入复习队列；也可点「复习全部」立即复习。", null)
+        : emptyBlock("暂无练习题", "当前资料未生成题目。AI 出题失败时可在重新上传后重试。", null));
+      if (containerId === "review-quiz-list") updateQuizStats(list || []);
+      return;
+    }
+    list.forEach(function (q, qi) { box.appendChild(quizItem(q, qi, containerId, opts.study)); });
+    if (containerId === "review-quiz-list") updateQuizStats(list);
+  }
+
+  function quizItem(q, qi, containerId, study) {
+    var card = h("div", { class: "ca-review-quiz-item" });
+    card.appendChild(h("div", { class: "row-between" }, [
+      h("span", { class: "badge badge-muted", text: QTYPE_NAME[q.type] || q.type || "题目" }),
+      h("span", { class: "muted text-xs", text: study && q.docTitle ? q.docTitle : (q.difficulty ? ("难度 " + q.difficulty) : "") })
+    ]));
+    card.appendChild(h("div", { class: "ca-review-q-text", text: q.question || "" }));
+
+    var feedback = h("div", { class: "ca-review-feedback", hidden: true });
+    var answered = false;
+
+    function settle(ok, val, markBtn) {
+      if (answered) return;
+      answered = true;
+      if (markBtn) addClass(markBtn, "selected");
+      feedback.hidden = false;
+      feedback.className = "ca-review-feedback " + (ok ? "ok" : "bad");
+      clear(feedback);
+      var ansText = q.type === "choice" && q.answerIndex != null
+        ? (String.fromCharCode(65 + q.answerIndex) + ". " + (q.answer || ""))
+        : (q.answer == null ? "" : q.answer);
+      feedback.appendChild(h("div", { text: (ok ? "正确" : "答案：" + ansText) }));
+      if (q.explanation) feedback.appendChild(h("div", { class: "muted", text: q.explanation }));
+      // SM-2 记账：storage.recordAnswer 内部已调用 RH.sm2.review
+      var rh = RH();
+      var docTitle = q.docTitle || (study ? "" : (state.D && state.D.title) || "");
+      if (rh && rh.storage && typeof rh.storage.recordAnswer === "function" && docTitle) {
+        try { rh.storage.recordAnswer(docTitle, q, ok, val).then(function () { if (state) refreshStudy(); }).catch(function () {}); } catch (e) { /* 忽略 */ }
+      }
+      if (!study) {
+        state.quizAnswered = state.quizAnswered || {};
+        state.quizAnswered[containerId + "::" + qi] = { ok: ok };
+        updateQuizStats(currentQuizList());
+      }
+    }
+
+    var optionsBox = h("div", { class: "ca-review-options" });
+    if (q.type === "choice" && Array.isArray(q.options)) {
+      q.options.forEach(function (opt, oi) {
+        var btn = h("button", { class: "btn btn-sm ca-review-option", type: "button", text: String.fromCharCode(65 + oi) + ". " + (opt == null ? "" : opt) });
+        btn.addEventListener("click", function () { settle(oi === q.answerIndex, String.fromCharCode(65 + oi), btn); });
+        optionsBox.appendChild(btn);
+      });
+    } else if (q.type === "judge") {
+      [["正确", "正确"], ["错误", "错误"]].forEach(function (pair) {
+        var btn = h("button", { class: "btn btn-sm ca-review-option", type: "button", text: pair[0] });
+        btn.addEventListener("click", function () { settle(pair[1] === q.answer, pair[1], btn); });
+        optionsBox.appendChild(btn);
+      });
+    } else {
+      var input = h("input", { class: "input", type: "text", placeholder: "填入空格中的内容" });
+      var submit = h("button", { class: "btn btn-primary btn-sm", type: "button", text: "提交" });
+      function doCloze() {
+        var val = String(input.value || "").trim();
+        if (!val) return;
+        var norm = function (s) { return String(s).replace(/\s+/g, "").replace(/[，,。;；:：]/g, ""); };
+        var ok = norm(val) === norm(q.answer) || norm(q.answer).indexOf(norm(val)) >= 0;
+        settle(ok, val, null);
+        input.disabled = true;
+        submit.disabled = true;
+      }
+      submit.addEventListener("click", doCloze);
+      if (input.addEventListener) input.addEventListener("keydown", function (ev) { if (ev && ev.key === "Enter") doCloze(); });
+      optionsBox.appendChild(input);
+      optionsBox.appendChild(submit);
+    }
+    card.appendChild(optionsBox);
+    card.appendChild(feedback);
+    return card;
+  }
+
+  function currentQuizList() { return (state.D && state.D.quiz) || []; }
+
+  function updateQuizStats(list) {
+    var el = state.ui.quizStats;
+    if (!el) return;
+    list = list || [];
+    var answered = state.quizAnswered || {};
+    var keys = Object.keys(answered);
+    var ok = keys.filter(function (k) { return answered[k].ok; }).length;
+    el.textContent = "已答 " + keys.length + "/" + list.length + " · 正确 " + ok;
+  }
+
+  // ============================================================
+  // 复习（SM-2 · 到期卡片）
+  // ============================================================
+  function refreshStudy() {
+    var rh = RH();
+    if (!state || !state.ui) return Promise.resolve();
+    if (!rh || !rh.storage) { renderStudyStats(null); return Promise.resolve(); }
+    return Promise.resolve()
+      .then(function () { return rh.storage.getStats ? rh.storage.getStats() : null; })
+      .then(function (stats) {
+        if (!state) return;
+        renderStudyStats(stats);
+        return rh.storage.getAllCards ? rh.storage.getAllCards() : [];
+      })
+      .then(function (cards) {
+        if (!state) return;
+        renderDocFilter(cards || []);
+      })
+      .catch(function () { if (state) renderStudyStats(null); });
+  }
+
+  function renderStudyStats(stats) {
+    var box = state.ui.studyStats;
+    if (!box) return;
+    clear(box);
+    var s = stats || { total: 0, due: 0, mastered: 0, weak: 0 };
+    var defs = [
+      { label: "已录题目", value: s.total || 0, cls: "" },
+      { label: "今日待复习", value: s.due || 0, cls: "emphasis" },
+      { label: "已掌握", value: s.mastered || 0, cls: "success" },
+      { label: "错题", value: s.weak || 0, cls: "danger" }
+    ];
+    defs.forEach(function (d) {
+      box.appendChild(h("div", { class: "stat " + d.cls }, [
+        h("div", { class: "stat-value", text: String(d.value) }),
+        h("div", { class: "stat-label", text: d.label })
+      ]));
+    });
+  }
+
+  function renderDocFilter(cards) {
+    var sel = state.ui.docFilter;
+    if (!sel) return;
+    var titles = [];
+    (cards || []).forEach(function (c) { if (c && c.docTitle && titles.indexOf(c.docTitle) < 0) titles.push(c.docTitle); });
+    var cur = sel.value || "";
+    clear(sel);
+    sel.appendChild(h("option", { value: "", text: "全部资料" }));
+    titles.forEach(function (t) { sel.appendChild(h("option", { value: t, text: t.length > 18 ? t.slice(0, 18) + "…" : t })); });
+    // 保留原选择（若已不存在则回落"全部"）
+    sel.value = titles.indexOf(cur) >= 0 ? cur : "";
+  }
+
+  function loadDue(all) {
+    var rh = RH();
+    if (!rh || !rh.storage) { toast("复习存储未加载", "error"); return Promise.resolve(); }
+    var filterEl = state.ui.docFilter;
+    var filter = filterEl && filterEl.value ? filterEl.value : "";
+    var p = all
+      ? (rh.storage.getAllCards ? rh.storage.getAllCards() : Promise.resolve([]))
+      : (rh.storage.getDueCards ? rh.storage.getDueCards() : Promise.resolve([]));
+    return Promise.resolve(p).then(function (cards) {
+      if (!state) return;
+      var list = (cards || []).map(function (c) {
+        return { qid: c.qid, type: c.type, question: c.question, options: c.options, answer: c.answer,
+          answerIndex: c.answerIndex, explanation: c.explanation, docTitle: c.docTitle };
+      });
+      if (filter) list = list.filter(function (c) { return c.docTitle === filter; });
+      renderQuiz("review-due-list", list, { study: true });
+    }).catch(function (err) { toastError(err, "读取复习卡片失败"); });
+  }
+
+  // ============================================================
+  // 资料库
+  // ============================================================
+  function refreshLibrary() {
+    var rh = RH();
+    var box = state && state.ui && state.ui.libList;
+    if (!box) return Promise.resolve();
+    if (!rh || !rh.storage || typeof rh.storage.listDocs !== "function") {
+      clear(box);
+      return Promise.resolve();
+    }
+    return Promise.resolve()
+      .then(function () { return rh.storage.listDocs(); })
+      .then(function (docs) {
+        if (!state || state.ui.libList !== box) return;
+        clear(box);
+        docs = docs || [];
+        if (!docs.length) {
+          box.appendChild(emptyBlock("资料库为空", "上传资料后会在这里保存文档与源文件，可随时打开继续学习。", null));
+          return;
+        }
+        docs.forEach(function (d) { box.appendChild(libraryRow(d)); });
+      })
+      .catch(function () { if (state && state.ui.libList === box) { clear(box); } });
+  }
+
+  function libraryRow(d) {
+    var row = h("div", { class: "ca-review-lib-row" });
+    var nPts = (d.sections || []).reduce(function (a, s) { return a + ((s.points || s.items || []).length); }, 0);
+    row.appendChild(h("div", { class: "list-main" }, [
+      h("div", { class: "list-title", text: d.title || "未命名文档" }),
+      h("div", { class: "list-meta", text: fmtSmart(d.time) + " · " + (d.sections || []).length + " 章 · " + nPts + " 要点 · " + (d.quiz || []).length + " 题" })
+    ]));
+    var group = h("div", { class: "btn-group" });
+    var openBtn = h("button", { class: "btn btn-sm", type: "button", text: "打开" });
+    openBtn.addEventListener("click", function () { openDoc(d.title); });
+    group.appendChild(openBtn);
+    if (d.sourceBlob && typeof URL !== "undefined" && URL.createObjectURL) {
+      var srcBtn = h("button", { class: "btn btn-sm", type: "button" }, [iconEl("download", 14), h("span", { text: "源文件" })]);
+      srcBtn.addEventListener("click", function () { downloadSource(d); });
+      group.appendChild(srcBtn);
+    }
+    var delBtn = h("button", { class: "btn btn-sm btn-ghost-danger", type: "button" }, [iconEl("trash", 14)]);
+    delBtn.addEventListener("click", function () { deleteDoc(d.title); });
+    group.appendChild(delBtn);
+    row.appendChild(group);
+    return row;
+  }
+
+  function openDoc(title) {
+    var rh = RH();
+    if (!rh || !rh.storage || typeof rh.storage.getDoc !== "function") return;
+    Promise.resolve(rh.storage.getDoc(title)).then(function (rec) {
+      if (!state || !rec) { if (!rec) toast("记录不存在", "error"); return; }
+      state.D = {
+        title: rec.title || title, engine: rec.engine || "", backend: rec.backend || "",
+        overview: rec.overview || "", keywords: rec.keywords || [], terms: rec.terms || [],
+        sections: rec.sections || [], quiz: rec.quiz || [],
+        original_sections: rec.original_sections || [], sourceBlob: rec.sourceBlob || null,
+        sourceName: rec.sourceName || "", sourceNames: rec.sourceNames || []
+      };
+      state.quizAnswered = {};
+      renderResult();
+      switchPane("points");
+      toast("已打开「" + (rec.title || title) + "」", "success");
+    }).catch(function (err) { toastError(err, "打开失败"); });
+  }
+
+  function deleteDoc(title) {
+    if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm("删除「" + title + "」？学习记录会保留。")) return;
+    var rh = RH();
+    if (!rh || !rh.storage || typeof rh.storage.deleteDoc !== "function") return;
+    Promise.resolve(rh.storage.deleteDoc(title)).then(function () {
+      if (!state) return;
+      if (state.D && state.D.title === title) { state.D = null; state.ui.result.hidden = true; }
+      refreshLibrary();
+      toast("已删除", "success");
+    }).catch(function (err) { toastError(err, "删除失败"); });
+  }
+
+  function downloadSource(rec) {
+    try {
+      var blob = rec.sourceBlob;
+      if (!blob) { toast("未保存源文件", "error"); return; }
+      var url = URL.createObjectURL(blob);
+      triggerDownload(url, rec.sourceName || (rec.title + ".bin"));
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    } catch (e) { toastError(e, "下载失败"); }
+  }
+
+  function triggerDownload(url, filename) {
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    if (typeof a.click === "function") a.click();
+    if (a.parentNode) a.parentNode.removeChild(a);
+  }
+
+  // 题库 JSON 导入（rh-quiz-v1：{title, questions:[...]} 或裸数组）
+  function importQuizFile(file) {
+    if (!file) return;
+    if (typeof file.text !== "function") { toast("无法读取该文件", "error"); return; }
+    Promise.resolve(file.text()).then(function (text) {
+      var json = JSON.parse(text);
+      var questions = json.questions || (Array.isArray(json) ? json : null);
+      if (!questions || !questions.length) throw new Error("JSON 中没有 questions 数组");
+      var title = json.title || stripExt(file.name);
+      var D = {
+        title: title, engine: "import", backend: "quiz-import",
+        overview: "", keywords: [], terms: [], sections: [], quiz: questions,
+        original_sections: [], sourceBlob: null, sourceName: file.name, sourceNames: [file.name]
+      };
+      state.D = D;
+      state.quizAnswered = {};
+      renderResult();
+      switchPane("quiz");
+      var rh = RH();
+      if (rh && rh.storage && typeof rh.storage.saveDoc === "function") {
+        try { rh.storage.saveDoc(title, { engine: D.engine, backend: D.backend, sections: [], quiz: questions, keywords: [], terms: [], overview: "", original_sections: [], markdown: "", sourceName: file.name }).then(function () { if (state) refreshLibrary(); }).catch(function () {}); } catch (e) { /* 忽略 */ }
+      }
+      toast("已导入 " + questions.length + " 道题", "success");
+    }).catch(function (err) { toastError(err, "导入失败"); });
+  }
+
+  // ============================================================
+  // 导出 Word（RH.exporter）
+  // ============================================================
+  function exportDoc() {
+    var rh = RH();
+    if (!state || !state.D) { toast("请先上传或打开一份资料", "info"); return; }
+    if (!rh || !rh.exporter || typeof rh.exporter.docxBlob !== "function") { toast("导出模块未加载", "error"); return; }
+    Promise.resolve(rh.exporter.docxBlob(state.D)).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      triggerDownload(url, (rh.exporter.filenameDocx ? rh.exporter.filenameDocx(state.D) : (state.D.title + "_复习要点.docx")));
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }).catch(function (err) { toastError(err, "导出失败"); });
+  }
+
+  function exportQuiz() {
+    var rh = RH();
+    if (!state || !state.D || !(state.D.quiz || []).length) { toast("当前资料没有题目", "info"); return; }
+    if (!rh || !rh.exporter || typeof rh.exporter.quizDocxBlob !== "function") { toast("导出模块未加载", "error"); return; }
+    Promise.resolve(rh.exporter.quizDocxBlob(state.D)).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      triggerDownload(url, (rh.exporter.filenameQuizDocx ? rh.exporter.filenameQuizDocx(state.D) : (state.D.title + "_自测卷.docx")));
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }).catch(function (err) { toastError(err, "导出失败"); });
+  }
+
+  // ============================================================
+  // 事件绑定
+  // ============================================================
+  function bindEvents(ui) {
+    // 选择文件
+    if (ui.refs.pickBtn) ui.refs.pickBtn.addEventListener("click", function () { ui.refs.fileInput.click(); });
+    if (ui.refs.fileInput) ui.refs.fileInput.addEventListener("change", function (ev) {
+      var t = ev && ev.target ? ev.target : ui.refs.fileInput;
+      handleFiles(t.files);
+      try { t.value = ""; } catch (e) { /* 允许重复选择同一文件 */ }
+    });
+
+    // 拖放
+    var drop = ui.refs.upload;
+    if (drop && drop.addEventListener) {
+      ["dragenter", "dragover"].forEach(function (t) {
+        drop.addEventListener(t, function (ev) { if (ev && ev.preventDefault) ev.preventDefault(); addClass(drop, "is-drag"); });
+      });
+      ["dragleave", "dragend"].forEach(function (t) {
+        drop.addEventListener(t, function () { removeClass(drop, "is-drag"); });
+      });
+      drop.addEventListener("drop", function (ev) {
+        removeClass(drop, "is-drag");
+        if (ev && ev.preventDefault) ev.preventDefault();
+        var dt = ev && ev.dataTransfer;
+        if (dt && dt.files) handleFiles(dt.files);
+      });
+    }
+
+    // 导出
+    if (ui.exportDocx) ui.exportDocx.addEventListener("click", exportDoc);
+    if (ui.exportQuiz) ui.exportQuiz.addEventListener("click", exportQuiz);
+
+    // 复习：开始
+    if (ui.startDue) ui.startDue.addEventListener("click", function () { loadDue(false); });
+    if (ui.startAll) ui.startAll.addEventListener("click", function () { loadDue(true); });
+    if (ui.docFilter) ui.docFilter.addEventListener("change", function () { loadDue(false); });
+
+    // 题库导入
+    if (ui.importBtn && ui.importInput) {
+      ui.importBtn.addEventListener("click", function () { ui.importInput.click(); });
+      ui.importInput.addEventListener("change", function (ev) {
+        var t = ev && ev.target ? ev.target : ui.importInput;
+        var f = t.files && t.files[0];
+        importQuizFile(f);
+        try { t.value = ""; } catch (e) { /* 忽略 */ }
+      });
+    }
+  }
+
+  // ============================================================
+  // 生命周期
+  // ============================================================
+  function mount(rootEl) {
+    if (!rootEl || typeof rootEl.appendChild !== "function") return;
+    var token = ++mountToken;
+    injectStyles();
+
+    state = { root: rootEl, D: null, pane: "points", quizAnswered: {} };
+    clear(rootEl);
+    var ui = buildSkeleton(rootEl);
+    state.ui = ui;
+
+    bindEvents(ui);
+
+    // 异步：资料库 / 复习统计；有历史文档时恢复最近一篇（便于直接进入资料库）
+    return Promise.resolve()
+      .then(function () { return refreshStudy(); })
+      .then(function () { return refreshLibrary(); })
+      .then(function () {
+        if (token !== mountToken || !state) return;
+        var rh = RH();
+        if (state.D || !rh || !rh.storage || typeof rh.storage.listDocs !== "function") return;
+        return Promise.resolve(rh.storage.listDocs()).then(function (docs) {
+          if (token !== mountToken || !state || state.D) return;
+          if (docs && docs.length) openDoc(docs[0].title);
+        });
+      })
+      .catch(function () { /* 启动期失败不阻断视图（app.js 会因 reject 清空视图） */ });
   }
 
   function unmount() {
+    mountToken++;
     state = null;
   }
 
@@ -1296,13 +1107,4 @@ window.CA = window.CA || {};
   // ============================================================
   CA.views = CA.views || {};
   CA.views.review = { mount: mount, unmount: unmount };
-  CA.review = {
-    formatVm: formatVm,
-    answerState: answerState,
-    mergeDocs: mergeDocs,
-    escapeHtml: esc,
-    importanceClass: importanceClass,
-    importanceLabel: importanceLabel,
-    difficultyLabel: difficultyLabel
-  };
 })();

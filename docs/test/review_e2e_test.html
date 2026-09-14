@@ -1,4 +1,14 @@
 <!DOCTYPE html>
+<!--
+  ⚠️⚠️ 已失效（双重原因）· 请勿参照 ⚠️⚠️
+  1) P1 异步化 + 登录门：本用例按旧数据层（同步 CA.store / CA.auth + 假身份切换）编写，
+     与现状（真实登录会话 + 数据层返回 Promise）不符。
+  2) P2 复习改版（方案 A · iframe）：主文档已不再挂载 src/review/** 能力模块，
+     复习 Tab 由 src/review-view.js 懒加载 iframe（docs/rh/index.html，RH 原版整包）。
+     因此本页加载的 src/review/*.js 在页面上无消费者，脚本末尾断言的
+     #review-upload / #review-tabs / #review-sections 也不再存在于主文档 DOM。
+  结论：本页运行必失败，仅作历史留档；复习链路请改用 docs/rh/ 内 RH 原版页面自测。
+-->
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -11,6 +21,11 @@
   <script>if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
 </head>
 <body>
+  <!-- ⚠️ 已失效（P1 异步化 + 登录门 + P2 复习 iframe 改版）：本用例不再适用，仅作历史留档，请勿参照 -->
+  <div style="background:#b91c1c;color:#fff;padding:10px 14px;font-weight:700;line-height:1.5">
+    ⚠️ 本测试已失效（P1 异步化/登录门，且 P2 复习已改为 iframe 内嵌 RH）——结果不可信，请勿参照。
+    复习链路自测请改用 docs/rh/ 内 RH 原版页面。
+  </div>
   <header id="topbar">
     <div id="brand">E2E 测试<span id="brand-sub">复习链路</span></div>
     <div id="topbar-right">

@@ -1,25 +1,77 @@
 // charts.js —— ECharts 封装 + 无 echarts（CDN 失败）时的 CSS 降级
 // 依赖：全局 window.echarts（可选）；本模块零依赖，echarts 缺失时渲染 CSS 条形图/表格
-// 配色对齐 DESIGN.md 第 9 节：主序列 --primary(#0d9488)、对比 --info/--warn、网格 #eef2f6
+// v4 配色（DESIGN.md §9）：优先读 :root CSS 变量（getComputedStyle），不可读时回退 v4 字面量；
+//   主序列 --primary(靛蓝)、对比 --info(天蓝)/--accent(橙)、网格 --border-faint、轴文字 --text-3。
 window.CA = window.CA || {};
 CA.charts = (function () {
   "use strict";
 
-  // ---------- 图表色板（与 DESIGN.md 设计 token 对齐；ECharts 需要字面量颜色） ----------
-  const P = {
-    primary: "#0d9488",       // --primary
-    primaryLight: "#5eead4",  // 主色浅（面积渐变）
-    info: "#0284c7",          // --info
-    warn: "#d97706",          // --warn
-    success: "#16a34a",       // --success
-    danger: "#dc2626",        // --danger
-    grid: "#eef2f6",          // 网格线（极淡）
-    axisLine: "#e2e8f0",      // 轴线
-    axisText: "#94a3b8",      // 轴文字（--text-3）
-    text: "#0f172a",          // --text
-    surface: "#ffffff",       // tooltip 底
-    border: "#e2e8f0"         // --border
+  // ---------- v4.1 色板：CSS 变量优先；ECharts 需要字面量颜色，故此处解析并带回退 ----------
+  // 回退值与 styles.css :root 的 v4.1 token 一致（无 DOM / 读不到变量时使用）
+  const FALLBACK = {
+    primary: "#2B4ACB",   // --primary（墨蓝）
+    info: "#0E7C92",      // --info（青）
+    accent: "#CF5A1C",    // --accent（陶土橙）
+    warn: "#8C6800",      // --warn
+    success: "#2E7D5B",   // --success
+    danger: "#C4353F",    // --danger
+    line: "#1E2230",      // --line（墨描边 / tooltip 边框）
+    grid: "#F0E7D9",      // --border-faint（网格线）
+    axisLine: "#E2D6C4",  // --border（轴线）
+    axisText: "#6E6879",  // --text-3（轴文字）
+    text: "#191A21",      // --text
+    surface: "#ffffff"    // --surface（tooltip 底）
   };
+
+  // 读取 :root 上的 CSS 变量；测试 / 无 DOM 环境下安全回退
+  function cssVar(name, fallback) {
+    try {
+      if (typeof document !== "undefined" && document.documentElement &&
+          typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+        const v = window.getComputedStyle(document.documentElement).getPropertyValue(name);
+        if (v && String(v).trim()) return String(v).trim();
+      }
+    } catch (e) { /* 回退 */ }
+    return fallback;
+  }
+
+  // hex -> rgba（趋势图面积渐变需要带透明度）
+  function withAlpha(color, a) {
+    const c = String(color == null ? "" : color).trim();
+    const m6 = /^#([0-9a-f]{6})$/i.exec(c);
+    if (m6) {
+      const n = parseInt(m6[1], 16);
+      return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
+    }
+    const m3 = /^#([0-9a-f]{3})$/i.exec(c);
+    if (m3) {
+      const h = m3[1];
+      const n = parseInt(h[0] + h[0] + h[1] + h[1] + h[2] + h[2], 16);
+      return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
+    }
+    return "rgba(43,74,203," + a + ")";   // 回退主色 #2B4ACB
+  }
+
+  // 色板单例（:root token 不随角色变化，读一次即可）
+  let _pal = null;
+  function palette() {
+    if (_pal) return _pal;
+    _pal = {
+      primary: cssVar("--primary", FALLBACK.primary),
+      info: cssVar("--info", FALLBACK.info),
+      accent: cssVar("--accent", FALLBACK.accent),
+      warn: cssVar("--warn", FALLBACK.warn),
+      success: cssVar("--success", FALLBACK.success),
+      danger: cssVar("--danger", FALLBACK.danger),
+      line: cssVar("--line", FALLBACK.line),
+      grid: cssVar("--border-faint", FALLBACK.grid),
+      axisLine: cssVar("--border", FALLBACK.axisLine),
+      axisText: cssVar("--text-3", FALLBACK.axisText),
+      text: cssVar("--text", FALLBACK.text),
+      surface: cssVar("--surface", FALLBACK.surface)
+    };
+    return _pal;
+  }
 
   // 图表实例缓存：el -> { el, inst }，重复调用同一容器先 dispose
   const instances = [];
@@ -46,28 +98,30 @@ CA.charts = (function () {
 
   // ---------- ECharts 通用样式片段 ----------
   function tooltipStyle(trigger, pointer) {
+    const pal = palette();
     return {
       trigger: trigger || "axis",
       axisPointer: pointer ? { type: pointer } : undefined,
-      backgroundColor: P.surface,
-      borderColor: P.border,
-      borderWidth: 1,
+      backgroundColor: pal.surface,
+      borderColor: pal.line,
+      borderWidth: 2,
       padding: [8, 12],
-      textStyle: { color: P.text, fontSize: 12 },
-      extraCssText: "border-radius:10px;box-shadow:0 8px 24px rgba(15,23,42,.12);"
+      textStyle: { color: pal.text, fontSize: 12 },
+      // v4：硬边实色投影（0 blur）+ 墨边
+      extraCssText: "border-radius:10px;box-shadow:4px 4px 0 " + pal.line + ";"
     };
   }
 
   function axisLabel() {
-    return { color: P.axisText, fontSize: 12 };
+    return { color: palette().axisText, fontSize: 12 };
   }
 
   function splitLine() {
-    return { lineStyle: { color: P.grid } };
+    return { lineStyle: { color: palette().grid } };
   }
 
   function axisLine() {
-    return { lineStyle: { color: P.axisLine } };
+    return { lineStyle: { color: palette().axisLine } };
   }
 
   // ---------- resize 自适应（单例） ----------
@@ -137,12 +191,9 @@ CA.charts = (function () {
 
   // ---------- 降级渲染（使用 styles.css 的 .bar-* 设计类，主色 + 数值标签） ----------
   function emptyHtml(title, desc) {
+    // v4：空态用 Agnes 插画（.ca-art ca-art-scores，见 DESIGN.md §4.10/§13.1），不再内联线性 SVG
     return '<div class="empty">' +
-      '<div class="empty-icon" aria-hidden="true">' +
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6" rx="1"/>' +
-      '<rect x="12" y="8" width="3" height="10" rx="1"/><rect x="17" y="5" width="3" height="13" rx="1"/></svg>' +
-      "</div>" +
+      '<div class="empty-icon ca-art ca-art-scores" aria-hidden="true"></div>' +
       '<div class="empty-title">' + esc(title || "暂无数据") + "</div>" +
       (desc ? '<p class="empty-desc">' + esc(desc) + "</p>" : "") +
       "</div>";
@@ -209,6 +260,7 @@ CA.charts = (function () {
     opts = opts || {};
     const labels = opts.labels || [];
     const counts = opts.counts || [];
+    const pal = palette();
     return render(el, {
       tooltip: tooltipStyle("axis", "shadow"),
       grid: { left: 8, right: 16, top: 24, bottom: 4, containLabel: true },
@@ -222,8 +274,8 @@ CA.charts = (function () {
       },
       series: [{
         type: "bar", data: counts, barMaxWidth: 42,
-        itemStyle: { color: P.primary, borderRadius: [6, 6, 0, 0] },
-        label: { show: true, position: "top", color: P.text, fontSize: 11 }
+        itemStyle: { color: pal.primary, borderRadius: [6, 6, 0, 0] },
+        label: { show: true, position: "top", color: pal.text, fontSize: 11 }
       }]
     }, function (fb) {
       fallbackBars(fb, labels.map(function (l, i) { return { label: l, value: counts[i] || 0 }; }), "count");
@@ -233,7 +285,9 @@ CA.charts = (function () {
   // 历次趋势折线图（多序列显示图例；单序列隐藏图例并加主色面积）
   function trend(el, opts) {
     opts = opts || {};
-    const colors = [P.primary, P.info, P.warn, P.success];
+    const pal = palette();
+    // v4 对比序列：主色 → 天蓝 → 橙 → 上升绿（DESIGN §9）
+    const colors = [pal.primary, pal.info, pal.accent, pal.success];
     const rawSeries = opts.series || [];
     const multi = rawSeries.length > 1;
     const series = rawSeries.map(function (s, i) {
@@ -248,7 +302,7 @@ CA.charts = (function () {
         item.areaStyle = {
           color: {
             type: "linear", x: 0, y: 0, x2: 0, y2: 1,
-            colorStops: [{ offset: 0, color: "rgba(13,148,136,.22)" }, { offset: 1, color: "rgba(13,148,136,0)" }]
+            colorStops: [{ offset: 0, color: withAlpha(pal.primary, 0.22) }, { offset: 1, color: withAlpha(pal.primary, 0) }]
           }
         };
       }
@@ -257,7 +311,7 @@ CA.charts = (function () {
     return render(el, {
       tooltip: tooltipStyle("axis", "line"),
       legend: multi
-        ? { bottom: 0, icon: "circle", itemWidth: 8, itemHeight: 8, textStyle: { color: P.axisText, fontSize: 12 } }
+        ? { bottom: 0, icon: "circle", itemWidth: 8, itemHeight: 8, textStyle: { color: pal.axisText, fontSize: 12 } }
         : { show: false },
       grid: { left: 8, right: 16, top: 16, bottom: multi ? 36 : 8, containLabel: true },
       xAxis: {
@@ -285,17 +339,18 @@ CA.charts = (function () {
       const f = Number(fullScores[i]) || 0;
       if (f > maxFull) maxFull = f;
     }
+    const pal = palette();
     const data = subjects.map(function (s, i) { return round1(averages[i] || 0); });
     const option = {
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "shadow" },
-        backgroundColor: P.surface,
-        borderColor: P.border,
-        borderWidth: 1,
+        backgroundColor: pal.surface,
+        borderColor: pal.line,
+        borderWidth: 2,
         padding: [8, 12],
-        textStyle: { color: P.text, fontSize: 12 },
-        extraCssText: "border-radius:10px;box-shadow:0 8px 24px rgba(15,23,42,.12);",
+        textStyle: { color: pal.text, fontSize: 12 },
+        extraCssText: "border-radius:10px;box-shadow:4px 4px 0 " + pal.line + ";",
         formatter: function (params) {
           const p = params && params[0];
           if (!p) return "";
@@ -317,16 +372,16 @@ CA.charts = (function () {
       },
       series: [{
         type: "bar", data: data, barMaxWidth: 46,
-        itemStyle: { color: P.primary, borderRadius: [6, 6, 0, 0] },
-        label: { show: true, position: "top", color: P.text, fontSize: 11 }
+        itemStyle: { color: pal.primary, borderRadius: [6, 6, 0, 0] },
+        label: { show: true, position: "top", color: pal.text, fontSize: 11 }
       }]
     };
     if (maxFull > 0) {
       option.series[0].markLine = {
         silent: true,
         symbol: "none",
-        lineStyle: { type: "dashed", color: P.warn },
-        data: [{ yAxis: maxFull, label: { formatter: "满分 " + maxFull, position: "end", color: P.warn } }]
+        lineStyle: { type: "dashed", color: pal.warn },
+        data: [{ yAxis: maxFull, label: { formatter: "满分 " + maxFull, position: "end", color: pal.warn } }]
       };
     }
     return render(el, option, function (fb) {

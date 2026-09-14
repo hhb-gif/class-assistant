@@ -1,9 +1,13 @@
-// Agent A 自测：契约第 10 节
+// 数据层自测（P1b 版）：内存 PG mock + 异步 store + 驼峰↔下划线映射 + 新集合覆盖
 // 运行：node docs/test/store_test.mjs
+//
+// 设计：mock 一张 postgREST 风格的内存 PG（tables 用 snake_case 列名），
+//       用 seed.build() 灌入 fixtures，从而在真实数据规模上验证 store 的读写与映射。
 import { createRequire } from "node:module";
 
 // ---------- 浏览器替身：window + 内存版 localStorage ----------
 global.window = global;
+global.window.CA_CONFIG = { envId: "env-test", publishableKey: "pk-test", llm: { model: "deepseek-v4-flash" } };
 
 const _ls = Object.create(null);
 global.localStorage = {
@@ -15,10 +19,81 @@ global.localStorage = {
   get length() { return Object.keys(_ls).length; }
 };
 
+// ---------- 内存 PG mock（{data,error} 包装，仅实现 store 用到的链式方法）----------
+const tables = {
+  members: [], users: [], notices: [], favorites: [], subscribers: [],
+  subjects: [], exams: [], scores: [], surveys: [], survey_responses: []
+};
+
+function exec(table, op, payload, filters) {
+  const arr = tables[table] || [];
+  const match = function (r) { return filters.every(function (f) { return r[f[0]] === f[1]; }); };
+  if (op === "select") return { data: arr.filter(match).map(function (r) { return Object.assign({}, r); }) };
+  if (op === "insert") {
+    if (table === "favorites" && arr.some(function (r) {
+      return r.notice_id === payload.notice_id && r.user_id === payload.user_id;
+    })) {
+      return { error: { code: "23505", message: "duplicate key value violates unique constraint" } };
+    }
+    if (table === "survey_responses" && arr.some(function (r) {
+      return r.survey_id === payload.survey_id && r.member_id === payload.member_id;
+    })) {
+      return { error: { code: "23505", message: "duplicate key value violates unique constraint" } };
+    }
+    arr.push(Object.assign({}, payload));
+    return { data: [Object.assign({}, payload)] };
+  }
+  if (op === "update") {
+    arr.forEach(function (r) { if (match(r)) Object.assign(r, payload); });
+    return { data: arr.filter(match).map(function (r) { return Object.assign({}, r); }) };
+  }
+  if (op === "delete") {
+    for (let i = arr.length - 1; i >= 0; i--) { if (match(arr[i])) arr.splice(i, 1); }
+    return { data: null };
+  }
+  return { data: null };
+}
+
+function builder(table) {
+  let op = null, payload = null;
+  const filters = [];
+  const b = {};
+  b.select = function () { op = "select"; return b; };
+  b.insert = function (row) { op = "insert"; payload = row; return b; };
+  b.update = function (row) { op = "update"; payload = row; return b; };
+  b.delete = function () { op = "delete"; return b; };
+  b.eq = function (col, val) { filters.push([col, val]); return b; };
+  b.then = function (res, rej) {
+    return Promise.resolve().then(function () { return exec(table, op, payload, filters); }).then(res, rej);
+  };
+  b.catch = function (rej) { return b.then(function (v) { return v; }, rej); };
+  return b;
+}
+
+let loggedIn = true;
+global.CA = {
+  cloud: {
+    ready: function () { return true; },
+    ensure: function () {},
+    lastError: function () { return null; },
+    db: { from: function (t) { return builder(t); } },
+    auth: {
+      getSession: function () {
+        return Promise.resolve({ data: { session: loggedIn ? { user: { id: "uid-teacher" } } : null }, error: null });
+      },
+      signInWithPassword: function () { loggedIn = true; return Promise.resolve({ data: { session: { user: { id: "uid-teacher" } } }, error: null }); },
+      signOut: function () { loggedIn = false; return Promise.resolve({ error: null }); },
+      resetPasswordForOld: function (c) { global.__resetArgs = c; return Promise.resolve({ error: null }); }
+    }
+  }
+};
+
 const require = createRequire(import.meta.url);
+require("../src/seed.js");   // 先加载 seed（此时 CA.store 未定义 → 跳过其内部 init）
 require("../src/store.js");
-require("../src/seed.js");
 require("../src/auth.js");
+
+const CA = global.CA;
 
 // ---------- 断言小工具 ----------
 let pass = 0, fail = 0;
@@ -26,14 +101,45 @@ function ok(cond, msg) {
   if (cond) { pass++; console.log("  \u2713 " + msg); }
   else { fail++; console.log("  \u2717 " + msg); }
 }
-function eq(a, b, msg) {
-  ok(a === b, msg + "（期望 " + JSON.stringify(b) + "，实际 " + JSON.stringify(a) + "）");
-}
+function eq(a, b, msg) { ok(a === b, msg + "（期望 " + JSON.stringify(b) + "，实际 " + JSON.stringify(a) + "）"); }
 function section(t) { console.log("\n[" + t + "]"); }
+const has = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
 
-const CA = global.CA;
+// ---------- 用 seed 灌入 PG fixtures（camel → snake，模拟云端行）----------
+const db = CA.seed.build();
 
-// ---------- 1. seed 确定性 ----------
+function camelToSnakeColl(coll) {
+  const maps = {
+    members: { studentNo: "student_no", createdAt: "created_at" },
+    users: { memberId: "member_id", mustChangePassword: "must_change_password", displayName: "display_name", createdAt: "created_at" },
+    notices: { timeLabel: "time_label", endTime: "end_time", publisherId: "publisher_id", createdAt: "created_at", updatedAt: "updated_at" },
+    favorites: { userId: "user_id", noticeId: "notice_id", createdAt: "created_at" },
+    subjects: { fullScore: "full_score", order: "sort_order" },
+    exams: { date: "exam_date", createdAt: "created_at" },
+    scores: { examId: "exam_id", subjectId: "subject_id", memberId: "member_id" },
+    surveys: { desc: "description", createdBy: "created_by", createdAt: "created_at", updatedAt: "updated_at" },
+    responses: { surveyId: "survey_id", memberId: "member_id", createdAt: "created_at" }
+  };
+  const table = coll === "responses" ? "survey_responses" : coll;
+  return (db[coll] || []).map(function (o) {
+    const m = maps[coll] || {};
+    const row = {};
+    Object.keys(o).forEach(function (k) { row[m[k] || k] = o[k]; });
+    return row;
+  });
+}
+["members", "subjects", "exams", "scores", "surveys", "responses"].forEach(function (c) {
+  tables[c === "responses" ? "survey_responses" : c] = camelToSnakeColl(c);
+});
+// auth 用到的 users 行（真实环境 uid 为 19 位串，这里用可读替身）
+tables.users = [
+  { uid: "uid-teacher", member_id: null, role: "superAdmin", must_change_password: false, display_name: "王老师", created_at: "2026-01-01T00:00:00Z" },
+  { uid: "uid-leader", member_id: "m_20230301", role: "admin", must_change_password: true, display_name: null, created_at: "2026-01-01T00:00:00Z" }
+];
+
+// ============================================================
+// 1. seed 确定性（种子生成与 store 无关）
+// ============================================================
 section("seed 确定性");
 const s1 = CA.seed.build();
 const s2 = CA.seed.build();
@@ -41,151 +147,187 @@ eq(JSON.stringify(s1) === JSON.stringify(s2), true, "两次 build JSON 序列化
 eq(s1.version, 1, "version = 1");
 eq(s1.members.length, 30, "members 恰好 30 人");
 eq(s1.scores.length, 450, "scores 恰好 450 条");
-eq(s1.users.length, 5, "users 5 个");
-eq(s1.notices.length, 8, "notices 8 条");
+eq(s1.subjects.length, 5, "subjects 恰好 5 科");
+eq(s1.exams.length, 3, "exams 恰好 3 次");
+eq(s1.surveys.length, 2, "surveys 恰好 2 个");
+eq(s1.responses.length, 42, "responses 恰好 42 条");
 
-// ---------- 2. init 幂等 ----------
-section("init 幂等");
-CA.store.init();
-const snap1 = localStorage.getItem("ca_db");
-CA.store.init();
-const snap2 = localStorage.getItem("ca_db");
-ok(snap1 === snap2 && !!snap1, "连续两次 init 数据不变");
-ok(snap1 && snap1.length > 0, "ca_db 已写入 localStorage");
+// ============================================================
+// 2. init / members 缓存
+// ============================================================
+section("init / members 缓存");
+const inited = await CA.store.init();
+eq(inited, true, "init 返回 true");
+eq(CA.store.memberName("m_20230302"), "张天宇", "memberName 同步命中缓存");
+eq(CA.store.memberName("m_not_exist"), "", "memberName 未命中返回空串");
+const m0 = await CA.store.get("members");
+eq(m0.length, 30, "get members 30 人");
+m0[0].name = "被篡改";
+eq((await CA.store.get("members"))[0].name !== "被篡改", true, "get 返回深拷贝，外部改动不污染缓存");
 
-// ---------- 3. 数据规格 ----------
-section("数据规格");
-eq(CA.store.get("members").length, 30, "store members 30 人");
-eq(CA.store.get("scores").length, 450, "store scores 450 条");
-eq(CA.store.get("subjects").length, 5, "subjects 5 科");
-eq(CA.store.get("exams").length, 3, "exams 3 次");
-eq(CA.store.get("favorites").length, 2, "favorites 2 条");
+// ============================================================
+// 3. 成绩集合：读取 + 驼峰映射
+// ============================================================
+section("成绩集合（subjects / exams / scores）");
+const subjects = await CA.store.get("subjects");
+eq(subjects.length, 5, "subjects 5 科");
+const chinese = subjects.filter(function (s) { return s.id === "s_chinese"; })[0];
+eq(chinese.fullScore, 150, "subjects.fullScore ↔ full_score");
+eq(chinese.order, 1, "subjects.order ↔ sort_order");
+ok(!has(chinese, "full_score") && !has(chinese, "sort_order"), "subject 对象无下划线残留字段");
 
-const users = CA.store.get("users");
-const byRole = {};
-users.forEach(function (u) { byRole[u.role] = (byRole[u.role] || 0) + 1; });
-eq(byRole.superAdmin, 1, "superAdmin 1 个（王老师）");
-eq(byRole.admin, 1, "admin 1 个（李思远）");
-eq(byRole.student, 3, "student 3 个");
-eq(CA.store.find("users", "u_teacher").role, "superAdmin", "王老师角色正确");
+const exams = await CA.store.get("exams");
+eq(exams.length, 3, "exams 3 次");
+const month1 = exams.filter(function (e) { return e.id === "e_month1"; })[0];
+eq(month1.date, "2026-03-15", "exams.date ↔ exam_date");
+ok(!!month1.createdAt, "exams.createdAt ↔ created_at");
 
-const mNos = CA.store.get("members").map(function (m) { return m.studentNo; });
-eq(mNos[0], "20230301", "学号起始 20230301");
-eq(mNos[29], "20230330", "学号结束 20230330");
-const mNames = CA.store.get("members").map(function (m) { return m.name; });
-["李思远", "张天宇", "陈嘉怡", "刘一鸣"].forEach(function (n) {
-  ok(mNames.indexOf(n) >= 0, "名单含 user 姓名：" + n);
-});
-ok(mNames.indexOf("王老师") < 0, "教师身份不出现在学生名单中");
+const scores = await CA.store.get("scores");
+eq(scores.length, 450, "scores 450 条");
+const one = scores[0];
+ok(!!one.examId && !!one.subjectId && !!one.memberId, "scores 驼峰字段完整（examId/subjectId/memberId）");
+ok(!has(one, "exam_id") && !has(one, "subject_id") && !has(one, "member_id"), "scores 对象无下划线残留字段");
+const byMemberExam = await CA.store.query("scores", function (s) { return s.memberId === "m_20230302" && s.examId === "e_month1"; });
+eq(byMemberExam.length, 5, "query 过滤命中 5 科");
+const foundScore = await CA.store.find("scores", one.id);
+eq(foundScore.id, one.id, "find scores 命中");
+eq(await CA.store.find("scores", "no_such_id"), null, "find 未命返 null");
 
-const surveys = CA.store.get("surveys");
+// ============================================================
+// 4. 信息收集集合：嵌套 jsonb 透传
+// ============================================================
+section("信息收集集合（surveys / responses）");
+const surveys = await CA.store.get("surveys");
 eq(surveys.length, 2, "surveys 2 个");
-const responses = CA.store.get("responses");
+const sv = surveys.filter(function (s) { return s.id === "sv_sports"; })[0];
+eq(sv.desc, "请选择你参加的项目，报名截止后由班委统一提交。", "surveys.desc ↔ description");
+eq(sv.createdBy, "u_studyleader", "surveys.createdBy ↔ created_by");
+ok(Array.isArray(sv.questions) && sv.questions.length === 2, "surveys.questions jsonb 数组透传");
+eq(sv.questions[0].qid, "q1", "questions[0].qid 保留");
+eq(sv.questions[0].options.length, 4, "questions options 保留");
+ok(!has(sv, "description") && !has(sv, "created_by"), "survey 对象无下划线残留字段");
+
+const responses = await CA.store.get("responses");
+eq(responses.length, 42, "responses 42 条");
 eq(responses.filter(function (r) { return r.surveyId === "sv_sports"; }).length, 24, "运动会报名 24 条");
 eq(responses.filter(function (r) { return r.surveyId === "sv_meeting"; }).length, 18, "班会投票 18 条");
+const r0 = responses[0];
+ok(!!r0.surveyId && !!r0.memberId, "responses surveyId/memberId 驼峰");
+ok(Array.isArray(r0.answers), "responses.answers jsonb 数组透传");
+ok(!has(r0, "survey_id") && !has(r0, "member_id"), "response 对象无下划线残留字段");
 
-const notices = CA.store.get("notices");
-eq(notices.filter(function (n) { return n.pinned; }).length, 2, "pinned 2 条");
-eq(notices.filter(function (n) { return n.important; }).length, 1, "important 1 条");
-eq(notices.filter(function (n) { return n.attachments && n.attachments.length > 0; }).length, 2, "含附件 2 条");
-eq(notices.filter(function (n) { return n.links && n.links.length > 0; }).length, 1, "含链接 1 条");
-const cats = {};
-notices.forEach(function (n) { cats[n.category] = 1; });
-eq(Object.keys(cats).length, 5, "覆盖 5 个通知分类");
+// ============================================================
+// 5. 写：scores add / update / remove
+// ============================================================
+section("CRUD · scores");
+const added = await CA.store.add("scores", { examId: "e_mid", subjectId: "s_math", memberId: "m_20230330", score: 88 });
+ok(/^sc_/.test(added.id), "add scores 生成 sc_ 前缀 id");
+eq(added.score, 88, "add 返回 score");
+const rawScoreRow = tables.scores.filter(function (r) { return r.id === added.id; })[0];
+ok(!!rawScoreRow, "add scores 已落库");
+eq(rawScoreRow.exam_id, "e_mid", "落库列名 exam_id");
+eq(rawScoreRow.subject_id, "s_math", "落库列名 subject_id");
+eq(rawScoreRow.member_id, "m_20230330", "落库列名 member_id");
+const updScore = await CA.store.update("scores", added.id, { score: 91 });
+eq(updScore.score, 91, "update scores 生效");
+eq(tables.scores.filter(function (r) { return r.id === added.id; })[0].score, 91, "update 已落库");
+eq(await CA.store.remove("scores", added.id), true, "remove scores 返回 true");
+eq(await CA.store.find("scores", added.id), null, "remove 后 find 为 null");
+eq((await CA.store.get("scores")).length, 450, "CRUD 后 scores 恢复 450 条");
 
-// 成绩特征
-const subjFull = {};
-CA.store.get("subjects").forEach(function (s) { subjFull[s.id] = s.fullScore; });
-function avgPct(memberId, examId) {
-  const rows = CA.store.query("scores", function (s) { return s.memberId === memberId && s.examId === examId; });
-  if (!rows.length) return 0;
-  let sum = 0;
-  rows.forEach(function (r) { sum += r.score / subjFull[r.subjectId]; });
-  return sum / rows.length;
-}
-eq(avgPct("m_20230304", "e_month2") > avgPct("m_20230304", "e_month1") + 0.08, true, "刘一鸣第三次考试明显进步");
-eq(avgPct("m_20230302", "e_month1") > 0.80, true, "张天宇稳定高分（第一次 > 0.80）");
-
-// ---------- 4. 深拷贝隔离 ----------
-section("深拷贝隔离");
-const got = CA.store.get("members");
-got[0].name = "被篡改";
-eq(CA.store.get("members")[0].name !== "被篡改", true, "外部改动不污染存储");
-const found = CA.store.find("users", "u_teacher");
-found.name = "被篡改";
-eq(CA.store.find("users", "u_teacher").name, "王老师", "find 返回值亦为深拷贝");
-CA.store.settings().aiEnabled = "污染";
-eq(CA.store.settings().aiEnabled, true, "settings 返回深拷贝");
-
-// ---------- 5. CRUD ----------
-section("CRUD");
-const added = CA.store.add("notices", {
-  title: "测试通知", category: "其他", content: "x", timeLabel: "相关时间",
-  deadline: "", endTime: "", location: "", course: "",
-  attachments: [], links: [], pinned: false, important: false, publisherId: "u_teacher"
+// ============================================================
+// 6. 写：surveys add / update（updated_at）/ toggle
+// ============================================================
+section("CRUD · surveys");
+const svAdded = await CA.store.add("surveys", {
+  title: "测试收集", desc: "说明", status: "open", anonymous: false,
+  deadline: "2026-12-01T18:00:00", createdBy: "uid-teacher",
+  questions: [{ qid: "q1", type: "single", title: "选一个", required: true, options: ["A", "B"] }]
 });
-ok(!!added.id && !!added.createdAt && !!added.updatedAt, "add 生成 id/createdAt/updatedAt");
-eq(CA.store.find("notices", added.id) !== null, true, "find 命中新增项");
-eq(CA.store.query("notices", function (n) { return n.id === added.id; }).length, 1, "query 命中 1 条");
-const upd = CA.store.update("notices", added.id, { title: "测试通知2" });
-eq(upd.title, "测试通知2", "update 合并 patch 并返回新对象");
-eq(CA.store.find("notices", added.id).title, "测试通知2", "update 已落库");
-eq(CA.store.remove("notices", added.id), true, "remove 返回 true");
-eq(CA.store.find("notices", added.id), null, "remove 后 find 为 null");
-eq(CA.store.remove("notices", added.id), false, "重复 remove 返回 false");
-eq(CA.store.get("notices").length, 8, "CRUD 后 notices 恢复 8 条");
+ok(/^sv_/.test(svAdded.id), "add surveys 生成 sv_ 前缀 id");
+eq(svAdded.desc, "说明", "add 返回 desc（驼峰）");
+ok(!!svAdded.updatedAt, "add surveys 自动写 updatedAt");
+const rawSv = tables.surveys.filter(function (r) { return r.id === svAdded.id; })[0];
+eq(rawSv.description, "说明", "落库列名 description");
+eq(rawSv.created_by, "uid-teacher", "落库列名 created_by");
+ok(Array.isArray(rawSv.questions), "落库 questions 为数组（jsonb）");
+const beforeUpdate = rawSv.updated_at;
+await new Promise(function (r) { setTimeout(r, 5); });
+const svUpd = await CA.store.update("surveys", svAdded.id, { status: "closed" });
+eq(svUpd.status, "closed", "update surveys status 生效");
+ok(rawSv.updated_at !== beforeUpdate, "update surveys 刷新 updated_at");
+eq(await CA.store.remove("surveys", svAdded.id), true, "remove surveys 返回 true");
+eq((await CA.store.get("surveys")).length, 2, "CRUD 后 surveys 恢复 2 个");
 
-// ---------- 6. settings ----------
+// ============================================================
+// 7. 写：responses（唯一约束幂等语义）
+// ============================================================
+section("CRUD · responses");
+// 选一个 seed 中未提交 sv_meeting 的成员（避开唯一约束 survey_id+member_id）
+const respAdded = await CA.store.add("responses", {
+  surveyId: "sv_meeting", memberId: "m_20230301", answers: [{ qid: "q1", value: "周一早读" }]
+});
+ok(/^rs_/.test(respAdded.id), "add responses 生成 rs_ 前缀 id");
+eq(respAdded.surveyId, "sv_meeting", "add 返回 surveyId");
+ok(Array.isArray(respAdded.answers), "add 返回 answers 数组");
+const rawResp = tables.survey_responses.filter(function (r) { return r.id === respAdded.id; })[0];
+eq(rawResp.survey_id, "sv_meeting", "落库列名 survey_id");
+eq(rawResp.member_id, "m_20230301", "落库列名 member_id");
+eq(await CA.store.remove("responses", respAdded.id), true, "remove responses 返回 true");
+
+// ============================================================
+// 8. favorites 唯一约束幂等（P1a 回归）
+// ============================================================
+section("favorites 唯一约束幂等");
+const f1 = await CA.store.add("favorites", { userId: "uid-teacher", noticeId: "n_exam_final" });
+const f2 = await CA.store.add("favorites", { userId: "uid-teacher", noticeId: "n_exam_final" });
+ok(!!f1 && !!f1.id, "首次 favorites 返回记录");
+eq(f2.id, f1.id, "重复 favorites 幂等返回既有记录");
+eq(tables.favorites.length, 1, "favorites 仅入库一条");
+
+// ============================================================
+// 9. 未支持集合仍抛可读错误
+// ============================================================
+section("未支持集合");
+let err = null;
+try { await CA.store.get("settings"); } catch (e) { err = e; }
+ok(!!err && /未支持的数据集合/.test(err.message), "未知集合抛可读错误");
+
+// ============================================================
+// 10. settings（本地偏好）
+// ============================================================
 section("settings");
-eq(CA.store.settings().currentUserId, "u_teacher", "默认身份 currentUserId");
 eq(CA.store.settings().aiEnabled, true, "默认 aiEnabled = true");
+ok(!("currentUserId" in CA.store.settings()), "settings 不再含 currentUserId");
 CA.store.setSettings({ aiEnabled: false, aiModel: "test-model" });
 eq(CA.store.settings().aiEnabled, false, "setSettings 写 aiEnabled");
 eq(CA.store.settings().aiModel, "test-model", "setSettings 写 aiModel");
-eq(CA.store.settings().currentUserId, "u_teacher", "setSettings 保留未改字段");
+CA.store.setSettings({ aiModel: "deepseek-v4-flash" });
 
-// ---------- 7. uid / memberName ----------
-section("uid / memberName");
-ok(/^t_[0-9a-z]{5,}$/.test(CA.store.uid("t")), "uid 形如 prefix_时间戳36+随机4位");
-ok(CA.store.uid("t") !== CA.store.uid("t"), "uid 不重复");
-eq(CA.store.memberName("m_20230302"), "张天宇", "memberName 映射正确");
-eq(CA.store.memberName("m_not_exist"), "", "memberName 未知返回空串");
-
-// ---------- 8. auth ----------
+// ============================================================
+// 11. auth（异步会话 + 角色）
+// ============================================================
 section("auth");
-eq(CA.auth.current().id, "u_teacher", "auth.current 默认王老师");
-eq(CA.auth.list().length, 5, "auth.list 5 人");
-eq(CA.auth.isSuperAdmin(), true, "王老师 isSuperAdmin");
-eq(CA.auth.isAdmin(), true, "王老师 isAdmin");
-eq(CA.auth.can("notice.manageAll"), true, "superAdmin 可 notice.manageAll");
-eq(CA.auth.can("member.manage"), true, "superAdmin 可 member.manage");
-eq(CA.auth.can("settings.ai"), true, "superAdmin 可 settings.ai");
+const me = await CA.auth.current();
+eq(me && me.id, "uid-teacher", "current 读取会话用户");
+eq(me && me.role, "superAdmin", "current role = superAdmin");
+eq(me && me.name, "王老师", "current name 取 display_name");
+eq(CA.auth.isAdmin(), true, "isAdmin 同步 true");
+eq(CA.auth.isSuperAdmin(), true, "isSuperAdmin 同步 true");
+eq(CA.auth.can("notice.publish"), true, "can notice.publish");
+eq(CA.auth.can("member.manage"), true, "can member.manage");
+eq(CA.auth.can("nope"), false, "未知 action 拒绝");
+const users = await CA.auth.list();
+eq(users.length, 2, "admin list 返回全部 users");
 
-eq(CA.auth.switchTo("u_studyleader"), true, "switchTo 学习委员成功");
-eq(CA.auth.current().id, "u_studyleader", "current 已切换");
-eq(CA.auth.isAdmin(), true, "admin isAdmin");
-eq(CA.auth.can("notice.publish"), true, "admin 可 notice.publish");
-eq(CA.auth.can("notice.manageAll"), false, "admin 不可 notice.manageAll");
-eq(CA.auth.can("member.manage"), false, "admin 不可 member.manage");
-eq(CA.auth.can("settings.ai"), false, "admin 不可 settings.ai");
-
-eq(CA.auth.switchTo("u_zhang"), true, "switchTo 学生成功");
-eq(CA.auth.isAdmin(), false, "学生非 admin");
-eq(CA.auth.can("notice.publish"), false, "学生不可 publish");
-eq(CA.auth.can("score.edit"), false, "学生不可 score.edit");
-eq(CA.auth.switchTo("u_not_exist"), false, "switchTo 非法用户返回 false");
-
-// ---------- 9. reset ----------
-section("reset");
-CA.store.add("members", { name: "临时同学", studentNo: "99999999" });
-eq(CA.store.get("members").length, 31, "临时新增后 members 31");
-CA.store.reset();
-eq(CA.store.get("members").length, 30, "reset 后 members 回到 30");
-ok(JSON.stringify(CA.store.get("notices")) === JSON.stringify(CA.seed.build().notices), "reset 恢复种子 notices");
-eq(CA.store.settings().currentUserId, "u_teacher", "reset 恢复默认身份");
-eq(CA.store.settings().aiEnabled, true, "reset 恢复 aiEnabled");
-ok(JSON.stringify(CA.store.get("scores")) === JSON.stringify(CA.seed.build().scores), "reset 恢复种子 scores");
-ok(JSON.stringify(CA.store.get("users")) === JSON.stringify(CA.seed.build().users), "reset 恢复种子 users");
+const loggedInMe = await CA.auth.login("20230301", "pw");
+eq(loggedInMe && loggedInMe.id, "uid-teacher", "login 返回身份");
+eq(await CA.auth.logout(), true, "logout 返回 true");
+eq(await CA.auth.current(), null, "logout 后 current 为 null");
+eq(CA.auth.can("notice.publish"), false, "logout 后 can 最小权限拒绝");
+let threw = false;
+try { CA.auth.switchTo("x"); } catch (e) { threw = true; }
+ok(threw, "switchTo 已废弃，显式抛错");
 
 // ---------- 汇总 ----------
 console.log("\n================================");
