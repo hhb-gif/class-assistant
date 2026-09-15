@@ -20,6 +20,13 @@
 
 > 旧环境（账号A · 体验版）已迁出；导出快照保留在 `temp/migration/`（本机，gitignored）。
 
+### 迁移后修复：jsonb 列被存成字符串
+导入时 jsonb 列（`surveys.questions`/`notices.attachments`/`notices.links`/`survey_responses.answers`）被写成字符串 → 收集题数显示 `112 道题`。
+已用 `update ... set col = (col #>> '{}')::jsonb where jsonb_typeof(col)='string'` 修复并复验（`jsonb_typeof` = `array`）。
+详见 `故障记录/2026-09-15-迁移jsonb列变字符串.md`。
+
+> 验收补充（新环境）：老师/学生双角色、成绩（30/15，RLS 生效）、收集（统计/文本回答/未交名单）、通知（置顶徽标）、资料库、留言、AI（`连接成功`）均通过。
+
 ---
 
 ## 目标
