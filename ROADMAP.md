@@ -225,18 +225,23 @@
 
 | 项 | 状态 |
 |----|------|
-| CloudBase 环境 ID | `class-assistant-d6fw1gdce84d261e`（ap-shanghai）✅ |
-| 套餐 | 体验版，到期 **2027-03-14** |
-| 数据后端 | **PostgreSQL（PG 模式）**；NoSQL / MySQL 均不可用 |
-| MCP 接入 | opencode 全局配置（本地模式 `@cloudbase/cloudbase-mcp@latest`）✅ 已验证连通 |
-| 环境级 API Key | 已配置 ⚠️ **仅存全局配置、严禁入库**；service_role 权限，疑似泄露需立即轮换 |
-| 静态托管 | 默认域名 `class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com`（已启用） |
-| 登录方式 | `usernamePassword=true`、**`anonymous=false`**、`email=false`、`phone=false` |
-| PG 业务表 | P1a 已建 5 张（members/users/notices/favorites/subscribers）+ RLS ✅ |
-| 附件 bucket | `attachments`（私有 pgstore）✅ |
+| **当前环境（生产）** | `class-d3gnxrv6252ef676c`（账号B · **个人版** · ap-shanghai · PG）✅ |
+| 到期 | **2026-10-15**（1 个月，需续费） |
+| 小程序关联 | `WxAppId: wx7ae52bc48a57d870` ✅ |
+| 数据后端 | **PostgreSQL（PG 模式）** |
+| 用户配额 | 个人版 **200 用户/月**（此前体验版仅 3 → 已解卡） |
+| 登录方式 | `usernamePassword=true` |
+| 迁移来源 | `class-assistant-d6fw1gdce84d261e`（账号A · 体验版 · PG，已迁出）；导出数据在 `temp/migration/` |
+| MCP 接入 | opencode 全局配置（本地模式）✅ |
+| 环境级 API Key | 已配置（Key 名 `migrate`）⚠️ **仅存全局配置、严禁入库** |
+| 🌐 访问地址① | `https://app-class-d3gnxrv6252ef676c.webapps.tcloudbase.com/`（短子域，推荐）✅ |
+| 🌐 访问地址② | `https://class-d3gnxrv6252ef676c-1488894548.tcloudbaseapp.com/`（静态托管默认域）✅ |
+| PG 业务表 | 13 张（含 `messages`/`class_materials`/`survey_anonymous_responses`）+ RLS ✅ |
+| 附件 bucket | `attachments`（私有 pgstore）+ storage RLS ✅ |
+| 云函数 | `ai-gateway`（→ DeepSeek，已验证 ✅）、`admin-user`（缺 CAM 密钥，待补） |
 | SDK | `cloudbase.full.js@3.9.3`（含 `app.rdb()`）✅ |
-| 🔴 Web 安全域名 | 体验版**无法添加**（localhost 未放行）→ 调试须走静态托管域 |
-| 🔴 用户配额 | 体验版**上限 3 个用户（含内置 administrator）**→ 30 账号须升配套餐 |
+| ⚠️ 默认域名限制 | 上述地址均为 CloudBase 默认域名：真实浏览器弹中间页、微信内触发下载 → 正式对外需绑**自定义域名（ICP 备案）** |
+| 👤 测试账号 | `teacher` / `Teacher@2026T`（superAdmin）；`20230301` / `Uestc@0230301`（member，首登强制改密） |
 | ⚠️ 密码策略 | 初始密码需 **≥3 类字符、≥8 位**，不能用纯学号 |
 | 🚀 部署 | P1a 已上线静态托管：`https://class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com/`（在 CORS 白名单）✅ |
 | 👤 测试账号 | `teacher`/`Teacher@2026`（superAdmin·王老师）；`20230301`/`Uestc@0230301`（member·李思远；首登会强制改密） |
@@ -283,6 +288,7 @@
 | 2026-09-14 | v1.6 | 应用户反馈：`.card-ink` 黑底→主色蓝；复习减少框嵌套（4→2 卡）；精简「演示」等废话文案；**新增「留言」Tab**（学生→老师，含回复闭环）；**通知附件真上传/下载** + 存储 RLS；浏览器实测通过 |
 | 2026-09-14 | v1.7 | 移除「高二(3)班」文案；**新增 webapps 子域**并实测登录可用；**移动端适配**（底部 6 项导航/紧凑顶栏/响应式卡片，390px 实测）；git 提交推送 |
 | 2026-09-14 | v1.8 | 修复 index.html 漏载 `collect.js`（收集恢复）；新增**短子域** `app-…`；通知/收集**点按收起**（toggle，`aria-expanded` 同步） |
+| 2026-09-15 | v2.0 | **环境迁移完成**：账号A 体验版 PG → 账号B **个人版 PG**（`class-d3gnxrv6252ef676c`，200 用户/月，关联小程序）；13 张表 + RLS + 数据全部迁移并浏览器验收；AI 网关/附件桶/账号重建；MCP 已切环境 |
 | 2026-09-15 | v1.9 | **P5 真交互补齐**：① 修 `collect.js` NodeList `.map` bug（添加选项/题目/保存全部失效）；② **匿名收集 = 真匿名**（D10 方案 B：PG 函数 + RPC、零策略 deny all、加盐 token 哈希）；③ **班级共享资料库**（D11，新表 `class_materials`，老师上传→全班可学，资料上云而学习记录仍留本机）；④ 设置页**成员增删改 + 账号管理 + 真实导出/重置**，新增云函数 `admin-user`；⑤ 新增「资料」Tab（7 项导航）；⑥ 发现并记录**迁移函数体分号截断**约束；测试 542 → **784** 断言，全部通过 |
 | 2026-09-15 | v1.10 | **修「学生也能改通知」**：定位到 `notices` 是全库唯一「UPDATE/DELETE 策略没强制 `app.is_admin()`」的表（原按 `publisher_id = auth.uid()` 授权），迁移 `20260915010400` 收紧为「管理员 AND（超管 或 发布者本人）」；前端 `canManage()` 改为**先判管理员能力再比 publisherId**（堵住 `undefined === undefined` 退化）；并补**写后回读校验** —— RLS 静默过滤（0 行受影响、无 error）不再被当成功（D12）。浏览器侧核对：`notices_test` 学生角色改为真实值 `member` + 新增 15 条权限/静默拦截断言；测试 784 → **799** 全绿 |
 

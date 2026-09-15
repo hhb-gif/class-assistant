@@ -25,8 +25,8 @@ AI（LLM）是贯穿各模块的**可选增强引擎**，带全局开关——�
 
 ## 在线演示
 
-- 短地址（推荐）：`https://app-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`
-- 备用：`https://class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com/`
+- 短地址（推荐）：`https://app-class-d3gnxrv6252ef676c.webapps.tcloudbase.com/`
+- 备用：`https://class-d3gnxrv6252ef676c-1488894548.tcloudbaseapp.com/`
 
 > **注意**：以上为 CloudBase **默认域名**，平台限制「仅供开发测试」——真实浏览器会弹访问提示中间页，微信内会触发下载（详见 [故障记录/2026-09-14-微信打开默认域名变下载.md](故障记录/)）。正式对外请绑定**自定义域名（需 ICP 备案）**。
 > 演示账号由管理员发放（体验版仅允许 3 个用户）。
