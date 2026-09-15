@@ -225,13 +225,15 @@
 
 | 项 | 状态 |
 |----|------|
-| **当前环境（生产）** | `class-d3gnxrv6252ef676c`（账号B · **个人版** · ap-shanghai · PG）✅ |
-| 到期 | **2026-10-15**（1 个月，需续费） |
+| **开发基线（决策 2026-09-15）** | `class-d3gnxrv6252ef676c`（账号B · **个人版** · ap-shanghai · PG）—— **唯一开发/生产基线** ✅ |
+| 到期 | **2026-10-15**（1 个月，需续费，否则隔离） |
+| 同账号其它环境 | `class-d9gpz1bn873a0b404`（账号B · 个人版 · 到期 2027-03-15）—— **空环境，未使用**（无表/无函数/无前端，仅系统默认文件）；保留或删除待定 |
+| 已退役环境 | `class-assistant-d6fw1gdce84d261e`（账号A · 体验版 · PG）—— 迁移来源，**转只读备份、不再开发**；导出快照在 `temp/migration/` |
 | 小程序关联 | `WxAppId: wx7ae52bc48a57d870` ✅ |
 | 数据后端 | **PostgreSQL（PG 模式）** |
 | 用户配额 | 个人版 **200 用户/月**（此前体验版仅 3 → 已解卡） |
 | 登录方式 | `usernamePassword=true` |
-| 迁移来源 | `class-assistant-d6fw1gdce84d261e`（账号A · 体验版 · PG，已迁出）；导出数据在 `temp/migration/` |
+| CLI / MCP | CLI 账号级 = 账号B（uin `100052915684`）；MCP 绑定 `class-d3gnxrv6252ef676c` ✅ |
 | MCP 接入 | opencode 全局配置（本地模式）✅ |
 | 环境级 API Key | 已配置（Key 名 `migrate`）⚠️ **仅存全局配置、严禁入库** |
 | 🌐 访问地址① | `https://app-class-d3gnxrv6252ef676c.webapps.tcloudbase.com/`（短子域，推荐）✅ |
@@ -243,22 +245,17 @@
 | ⚠️ 默认域名限制 | 上述地址均为 CloudBase 默认域名：真实浏览器弹中间页、微信内触发下载 → 正式对外需绑**自定义域名（ICP 备案）** |
 | 👤 测试账号 | `teacher` / `Teacher@2026T`（superAdmin）；`20230301` / `Uestc@0230301`（member，首登强制改密） |
 | ⚠️ 密码策略 | 初始密码需 **≥3 类字符、≥8 位**，不能用纯学号 |
-| 🚀 部署 | P1a 已上线静态托管：`https://class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com/`（在 CORS 白名单）✅ |
-| 👤 测试账号 | `teacher`/`Teacher@2026`（superAdmin·王老师）；`20230301`/`Uestc@0230301`（member·李思远；首登会强制改密） |
 | ✅ P1a 验收 | 已完成（多用户共享 + RLS 越权阻断 + 首登改密闭环），详情见 `故障记录/2026-09-14-P1a登录与越权修复.md` |
 | ✅ P1b | 成绩/收集上云 + RLS；`store` 支持 10 个集合；种子 5 科/3 考/450 成绩/2 收集/42 提交 |
 | 🎨 UI v4.1 | **Rounded Neo-brutalism** + **和谐化配色**（墨蓝 `#2B4ACB` + 陶土橙 `#CF5A1C` + 奶油底）；Agnes 插画按新色板重出 7 张；角色差异化；见 `DESIGN.md` |
 | ✅ P2 | 复习 Tab = **CA 原生 UI（v4）+ RH 引擎**（弃用 RH 整页 iframe，`docs/rh` 已删）；复习 AI 走 CloudBase 网关 |
 | ✅ P3 | AI 网关 = 云函数 `ai-gateway` → DeepSeek（免前端密钥）；**线上实测可用**（`testConnection` / `parseNotice` 通过） |
 | ✅ P5 · 迁移 | 新增三条：`20260915010200_class_materials`、`20260915010300_survey_anonymous`、`20260915010400_notices_admin_only_update`（均已 apply + 校验） |
-| ✅ P5 · 云函数 | `admin-user`（账号管理）已部署，`InstallDependency=TRUE`、Status Active、**环境变量为空**（未配则 `probe` 返回 `NO_CREDENTIAL`） |
-| ⚠️ 建号前置 | `admin-user` 需配 `TC_SECRET_ID` / `TC_SECRET_KEY`（tcb 管控面）+ `TCB_ENV_ID` + `TCB_API_KEY`（exec-pgsql 写 `users`）；**体验版用户上限 3 已满**（`administrator`/`teacher`/`20230301`），建号现在必失败 |
+| ✅ P5 · 云函数 | `admin-user`（账号管理）已部署，`InstallDependency=TRUE`、Status Active；新环境已配 `TCB_API_KEY`/`TCB_ENV_ID`，**缺 `TC_SECRET_ID`/`TC_SECRET_KEY`** → `probe` 返回 `NO_CREDENTIAL` |
+| ⚠️ 建号前置 | `admin-user` 还差 `TC_SECRET_ID` / `TC_SECRET_KEY`（tcb 管控面）才能建号/重置密码；**配额已非瓶颈**（个人版 200 用户/月，当前仅 3 个账号：`administrator`/`teacher`/`20230301`） |
 | 📌 迁移约束 | 迁移执行器按 `;` 切分：**`$$` 函数体内不得有分号**，用 `language sql` 单语句 + `CASE`/CTE 表达（详见故障记录 2026-09-15） |
 | 🔒 匿名数据 | `survey_anonymous_responses` RLS 零策略（deny all）；读写仅经 `app.submit_anonymous` / `my_anonymous` / `anon_summary`（+ `public` 同名包装层给 PostgREST 命中） |
 | ⚠️ 部署缓存 | 静态托管边缘会缓存 JS；`index.html` 本地资源统一带 `?v=<版本>`，**每次部署须 bump 版本号** |
-| 🌐 访问地址① | `https://class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com/`（静态托管默认域） |
-| 🌐 访问地址② | `https://class-assistant-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`（webapps 子域，`*.webapps.tcloudbase.com` 已在安全域名白名单）✅ |
-| 🌐 访问地址③ | `https://app-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`（**短子域，推荐**，服务名 `app`）✅ |
 | 🔑 密钥 | DeepSeek Key 存于云函数环境变量 `AI_API_KEY`（不入库）；**建议使用后轮换** |
 | 🗑️ 已清理 | 静态托管里遗留的 `rh/`（弃用的 RH iframe 副本）已删除 |
 
@@ -292,6 +289,7 @@
 | 2026-09-15 | v1.9 | **P5 真交互补齐**：① 修 `collect.js` NodeList `.map` bug（添加选项/题目/保存全部失效）；② **匿名收集 = 真匿名**（D10 方案 B：PG 函数 + RPC、零策略 deny all、加盐 token 哈希）；③ **班级共享资料库**（D11，新表 `class_materials`，老师上传→全班可学，资料上云而学习记录仍留本机）；④ 设置页**成员增删改 + 账号管理 + 真实导出/重置**，新增云函数 `admin-user`；⑤ 新增「资料」Tab（7 项导航）；⑥ 发现并记录**迁移函数体分号截断**约束；测试 542 → **784** 断言，全部通过 |
 | 2026-09-15 | v1.10 | **修「学生也能改通知」**：定位到 `notices` 是全库唯一「UPDATE/DELETE 策略没强制 `app.is_admin()`」的表（原按 `publisher_id = auth.uid()` 授权），迁移 `20260915010400` 收紧为「管理员 AND（超管 或 发布者本人）」；前端 `canManage()` 改为**先判管理员能力再比 publisherId**（堵住 `undefined === undefined` 退化）；并补**写后回读校验** —— RLS 静默过滤（0 行受影响、无 error）不再被当成功（D12）。浏览器侧核对：`notices_test` 学生角色改为真实值 `member` + 新增 15 条权限/静默拦截断言；测试 784 → **799** 全绿 |
 | 2026-09-15 | v1.11 | **补齐迁移回归**：`20260915010400_notices_admin_only_update` 迁移曾在重放时**漏应用到新环境**（`notices_update`/`notices_delete` 仍是旧策略，缺 `app.is_admin()` 前置），本次以 `includeAll=true` **乱序补应用**并复验两策略 `qual` 均含 `app.is_admin()`（迁移历史共 9 条）；`notices.publisher_id` 由旧环境 uid `2099452365032161282` **重映射**到新 teacher uid `2099862936471105538`（2 行）；前端 `?v=20260915a` → **`?v=20260915b`** 并重部署；8 个本地测试合计 **799** 断言全绿 |
+| 2026-09-15 | v1.12 | **确定开发基线**：以账号B 个人版 `class-d3gnxrv6252ef676c` 为**唯一开发/生产基线**；账号A 体验版 `class-assistant-d6fw1gdce84d261e` 转只读备份不再开发；记录账号B 下另一空环境 `class-d9gpz1bn873a0b404`（2027-03-15 到期，未使用）；CLI 账号级登录切至账号B，MCP 绑定基线环境 |
 
 ---
 
