@@ -80,15 +80,15 @@ ROADMAP.md PLAN-P1.md DESIGN.md CONTRACT.md REVIEW.md GOALS.md
 ## 测试
 
 ```powershell
-node docs/test/store_test.mjs      # 数据层           88
+node docs/test/store_test.mjs      # 数据层           94
 node docs/test/notices_test.mjs    # 通知/资料       158
 node docs/test/scores_test.mjs     # 成绩            148
 node docs/test/collect_test.mjs    # 信息收集        131
 node docs/test/review_test.mjs     # 复习视图         68
 node docs/test/messages_test.mjs   # 留言             43
 node docs/test/materials_test.mjs  # 班级资料         89
-node docs/test/settings_test.mjs   # 设置/成员/账号   74
-# 合计 799 项断言
+node docs/test/settings_test.mjs   # 设置/成员/账号   69
+# 合计 800 项断言
 ```
 
 ## 本地开发

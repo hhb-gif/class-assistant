@@ -343,6 +343,11 @@ CA.app = (function () {
     ]));
   }
 
+  // ---------- 设置页：功能开关 ----------
+  // 账号创建/重置：App 内暂不提供（改为管理员用管理工具统一导入）。
+  // 大后期如需在 App 内开放，需为云函数 admin-user 配齐 CAM 密钥后再置 true。
+  var ACCOUNT_MGMT_IN_APP = false;
+
   // ---------- 设置页：注入样式（不改 styles.css，只服务新增的管理控件） ----------
   function injectSettingsStyles() {
     if (!document.head || document.getElementById("ca-settings-style")) return;
@@ -354,6 +359,7 @@ CA.app = (function () {
       ".acct-cell{display:flex;gap:6px;align-items:center;flex-wrap:wrap}",
       ".settings-alert{margin:0 0 12px;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;border:1px solid transparent}",
       ".settings-alert.warn{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.45);color:#b45309}",
+      ".settings-alert.info{background:rgba(59,130,246,.10);border-color:rgba(59,130,246,.40);color:#1d4ed8}",
       ".form-grid{display:grid;gap:10px}",
       ".form-grid label{display:block;font-size:12px;font-weight:600;margin-bottom:4px}",
       ".form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}",
@@ -599,7 +605,12 @@ CA.app = (function () {
       ])
     ]);
 
-    if (acct && !acct.ready && !acct.skipped && acct.message) {
+    if (!ACCOUNT_MGMT_IN_APP) {
+      card.appendChild(el("div", {
+        class: "settings-alert info",
+        text: "账号由管理员统一导入开通；如需为学生新建账号或重置密码，请联系管理员。"
+      }));
+    } else if (acct && !acct.ready && !acct.skipped && acct.message) {
       card.appendChild(el("div", {
         class: "settings-alert warn",
         text: "账号服务未就绪：" + acct.message + "。请为云函数 admin-user 配置环境变量（TC_SECRET_ID / TC_SECRET_KEY / TCB_ENV_ID / TCB_API_KEY）后，再使用创建账号 / 重置密码。"
@@ -620,15 +631,19 @@ CA.app = (function () {
           class: "badge " + (isAdminRole(u.role) ? "badge-success" : "badge-muted"),
           text: roleLabel(u.role)
         }));
-        var rpBtn = el("button", { class: "btn btn-sm", type: "button", text: "重置密码" });
-        rpBtn.addEventListener("click", function () { openAccountForm(m, u, "resetPassword"); });
-        acctCell.appendChild(rpBtn);
+        if (ACCOUNT_MGMT_IN_APP) {
+          var rpBtn = el("button", { class: "btn btn-sm", type: "button", text: "重置密码" });
+          rpBtn.addEventListener("click", function () { openAccountForm(m, u, "resetPassword"); });
+          acctCell.appendChild(rpBtn);
+        }
       } else {
         acctCell.appendChild(el("span", { class: "badge badge-muted", text: "未建账号" }));
-        var cBtn = el("button", { class: "btn btn-sm", type: "button", text: "创建账号" });
-        if (acct && !acct.ready) cBtn.disabled = true;
-        cBtn.addEventListener("click", function () { openAccountForm(m, null, "create"); });
-        acctCell.appendChild(cBtn);
+        if (ACCOUNT_MGMT_IN_APP) {
+          var cBtn = el("button", { class: "btn btn-sm", type: "button", text: "创建账号" });
+          if (acct && !acct.ready) cBtn.disabled = true;
+          cBtn.addEventListener("click", function () { openAccountForm(m, null, "create"); });
+          acctCell.appendChild(cBtn);
+        }
       }
       var editBtn = el("button", { class: "btn btn-sm", type: "button", text: "编辑", onclick: function () { openMemberForm(m, members); } });
       var delBtn = el("button", { class: "btn btn-sm btn-danger", type: "button", text: "删除" });
@@ -666,18 +681,25 @@ CA.app = (function () {
     setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) { /* 忽略 */ } }, 1000);
   }
 
-  function buildDataCard(isAdmin) {
+  function buildDataCard(isAdmin, isSuperAdmin) {
     var btns = [
       el("button", { class: "btn btn-sm", type: "button", text: "导出数据 JSON", onclick: onExport })
     ];
-    if (isAdmin) {
-      btns.push(el("button", { class: "btn btn-sm btn-danger admin-only", type: "button", text: "重置数据", onclick: onReset }));
+    // 「重置数据」为全库高风险操作，仅超级管理员渲染（班委看不到）。
+    if (isSuperAdmin) {
+      btns.push(el("button", { class: "btn btn-sm btn-danger", type: "button", text: "重置数据", onclick: onReset }));
+    }
+    var desc;
+    if (isSuperAdmin) {
+      desc = "导出为云端真实数据快照（含所有集合）；重置会删除通知、成绩、收集、留言等业务数据，但保留班级名单与账号（仅超级管理员可重置）。";
+    } else if (isAdmin) {
+      desc = "导出为云端真实数据快照（含所有集合）。重置数据为全库高风险操作，仅超级管理员可用。";
+    } else {
+      desc = "导出为云端真实数据快照（含当前账号有权限读取的集合）。";
     }
     return el("div", { class: "card" }, [
       el("div", { class: "card-head" }, [el("div", { class: "card-title", text: "数据管理" })]),
-      el("p", { class: "muted", text: isAdmin
-        ? "导出为云端真实数据快照（含所有集合）；重置会删除通知、成绩、收集、留言等业务数据，但保留班级名单与账号。"
-        : "导出为云端真实数据快照（含当前账号有权限读取的集合）。" }),
+      el("p", { class: "muted", text: desc }),
       el("div", { class: "btn-group" }, btns)
     ]);
   }
@@ -706,11 +728,12 @@ CA.app = (function () {
       .then(function (me) {
         me = me || {};
         var isAdmin = !!(CA.auth && CA.auth.isAdmin && CA.auth.isAdmin());   // isAdmin 同步，不 await
+        var isSuperAdmin = !!(CA.auth && CA.auth.isSuperAdmin && CA.auth.isSuperAdmin());  // 同步
         // 仅管理员需要名单/用户表；普通用户跳过，避免触发无权限查询
         var pMembers = isAdmin ? CA.store.get("members") : Promise.resolve([]);
         var pUsers = isAdmin ? CA.store.get("users") : Promise.resolve([]);
         return Promise.all([pMembers, pUsers]).then(function (arr) {
-          return { me: me, isAdmin: isAdmin, members: arr[0] || [], users: arr[1] || [] };
+          return { me: me, isAdmin: isAdmin, isSuperAdmin: isSuperAdmin, members: arr[0] || [], users: arr[1] || [] };
         });
       })
       .then(function (data) {
@@ -720,12 +743,13 @@ CA.app = (function () {
         try { aiCfgReady = !!(CA.llm && CA.llm.ready && CA.llm.ready()); } catch (e) { aiCfgReady = false; }
         var aiModel = (CA.ai && CA.ai.info) ? (CA.ai.info().model || "") : "";   // 同步
 
-        // 账号服务状态：仅管理员探测云函数环境变量（缺变量时给出可读提示并禁用建号）
-        var pAcct = data.isAdmin
+        // 账号服务状态：仅管理员 + App 内开关打开时探测云函数环境变量（缺变量时给出可读提示并禁用建号）
+        var pAcct = (data.isAdmin && ACCOUNT_MGMT_IN_APP)
           ? probeAccountService()
           : Promise.resolve({ ready: false, message: "", skipped: true });
         return pAcct.then(function (acct) {
-          return { me: me, isAdmin: data.isAdmin, members: data.members, users: data.users,
+          return { me: me, isAdmin: data.isAdmin, isSuperAdmin: data.isSuperAdmin,
+                   members: data.members, users: data.users,
                    aiEnabled: aiEnabled, aiCfgReady: aiCfgReady, aiModel: aiModel, acct: acct };
         });
       })
@@ -771,8 +795,8 @@ CA.app = (function () {
         // 3) 班级名单 + 账号管理（仅管理员）
         if (data.isAdmin) wrap.appendChild(buildMembersCard(data, data.acct));
 
-        // 4) 数据管理（导出 / 重置；重置仅管理员）
-        wrap.appendChild(buildDataCard(data.isAdmin));
+        // 4) 数据管理（导出 / 重置；重置仅超级管理员）
+        wrap.appendChild(buildDataCard(data.isAdmin, data.isSuperAdmin));
 
         // 数据就绪：替换 loading 骨架
         root.innerHTML = "";
@@ -818,10 +842,10 @@ CA.app = (function () {
     });
   }
 
-  // 真实重置：仅管理员；两级确认（confirm + 输入「重置」）
+  // 真实重置：仅超级管理员；两级确认（confirm + 输入「重置」）
   // 逐集合串行删除，避免并发打爆；members / users 保留。失败的集合汇总报告。
   function onReset() {
-    if (!(CA.auth && CA.auth.isAdmin && CA.auth.isAdmin())) { toast("仅管理员可重置数据", "error"); return; }
+    if (!(CA.auth && CA.auth.isSuperAdmin && CA.auth.isSuperAdmin())) { toast("仅超级管理员可重置数据", "error"); return; }
     if (!window.confirm("确定重置数据吗？将删除通知、成绩、收集、留言等业务数据（保留班级名单与账号），不可恢复。")) return;
     var word = "";
     try { word = window.prompt("请输入「重置」二字以确认执行：", ""); } catch (e) { word = null; }

@@ -287,7 +287,17 @@ CA.store = (function () {
       return dbClient().from(tableOf(coll)).delete().eq(idColOf(coll), id).then(function (res) {
         unwrap(res, "删除 " + coll);
         if (coll === "members") { _memberCache = null; _memberById = {}; }
-        return true;
+        // 写后回读校验：RLS 过滤 DELETE 时 PostgREST 返回「0 行受影响、无 error」，
+        // 不回读就会把「没删掉」当成功（例如班委删老师通知被静默拦下）。
+        // 仍能查到该行 ⇒ 删除未生效，抛可读错误（置 __ca 避免被 run()/wrapErr 二次包裹）。
+        return find(coll, id).then(function (row) {
+          if (row) {
+            var err = new Error("删除 " + coll + " 失败：操作未生效（无权限，或该记录已被行级安全策略拒绝）");
+            err.__ca = true;
+            throw err;
+          }
+          return true;
+        });
       });
     });
   }

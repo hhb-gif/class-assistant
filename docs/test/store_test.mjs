@@ -25,6 +25,9 @@ const tables = {
   subjects: [], exams: [], scores: [], surveys: [], survey_responses: []
 };
 
+// 模拟 RLS 静默过滤：置位后该表 delete 返回「0 行受影响、无 error」，但数据不删。
+const silentDelete = Object.create(null);
+
 function exec(table, op, payload, filters) {
   const arr = tables[table] || [];
   const match = function (r) { return filters.every(function (f) { return r[f[0]] === f[1]; }); };
@@ -48,6 +51,7 @@ function exec(table, op, payload, filters) {
     return { data: arr.filter(match).map(function (r) { return Object.assign({}, r); }) };
   }
   if (op === "delete") {
+    if (silentDelete[table]) return { data: null };   // 模拟 RLS 过滤：不删、也不报 error
     for (let i = arr.length - 1; i >= 0; i--) { if (match(arr[i])) arr.splice(i, 1); }
     return { data: null };
   }
@@ -234,6 +238,22 @@ eq(tables.scores.filter(function (r) { return r.id === added.id; })[0].score, 91
 eq(await CA.store.remove("scores", added.id), true, "remove scores 返回 true");
 eq(await CA.store.find("scores", added.id), null, "remove 后 find 为 null");
 eq((await CA.store.get("scores")).length, 450, "CRUD 后 scores 恢复 450 条");
+
+// ============================================================
+// 5b. remove 回读校验（RLS 静默过滤不再被当成功）
+// ============================================================
+section("remove 回读校验（RLS 静默过滤）");
+tables.notices = [{ id: "n_rls", title: "删不掉的通知" }];
+silentDelete.notices = true;   // 模拟 DELETE 被策略过滤：0 行受影响、无 error
+let delErr = null;
+try { await CA.store.remove("notices", "n_rls"); } catch (e) { delErr = e; }
+ok(!!delErr, "删除被 RLS 静默过滤时抛错（不再当成功）");
+ok(delErr && /操作未生效/.test(delErr.message), "错误文案可读：" + (delErr && delErr.message));
+eq(delErr ? (delErr.message.match(/删除 notices 失败/g) || []).length : -1, 1, "错误未被 run()/wrapErr 二次包裹");
+eq((await CA.store.find("notices", "n_rls")) !== null, true, "回读确认记录仍在");
+silentDelete.notices = false;   // 策略放行
+eq(await CA.store.remove("notices", "n_rls"), true, "策略放行后 remove 返回 true");
+eq(await CA.store.find("notices", "n_rls"), null, "删除成功后 find 为 null");
 
 // ============================================================
 // 6. 写：surveys add / update（updated_at）/ toggle

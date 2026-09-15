@@ -7,7 +7,7 @@
   <meta name="description" content="班级管家 · 本地原型（通知 / 成绩 / 收集 / 复习 / 设置）">
   <title>班级管家</title>
 
-  <link rel="stylesheet" href="styles.css?v=20260915b">
+  <link rel="stylesheet" href="styles.css?v=20260915d">
 
   <!-- ECharts 5（CDN）：加载失败不阻塞页面，charts.js 自动降级为 CSS 条形图 -->
   <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"></script>
@@ -64,46 +64,46 @@
   <!-- ===== 脚本加载顺序（契约第 2 节，严格依次）：文件缺失时 404 静默 ===== -->
   <!-- CloudBase JS SDK v3 全量包（CDN，固定 3.9.3；含 app.rdb() + app.auth）。必须最先加载 -->
   <script src="https://static.cloudbase.net/cloudbase-js-sdk/3.9.3/cloudbase.full.js"></script>
-  <script src="src/config.js?v=20260915b"></script>
+  <script src="src/config.js?v=20260915d"></script>
   <!-- 云端客户端单例（依赖 config.js 与 CDN SDK；须在 store.js/auth.js 之前） -->
-  <script src="src/cloud.js?v=20260915b"></script>
-  <script src="src/llm.js?v=20260915b"></script>
-  <script src="src/store.js?v=20260915b"></script>
-  <script src="src/seed.js?v=20260915b"></script>
-  <script src="src/auth.js?v=20260915b"></script>
-  <script src="src/charts.js?v=20260915b"></script>
-  <script src="src/ai.js?v=20260915b"></script>
-  <script src="src/icons.js?v=20260915b"></script>
-  <script src="src/notices.js?v=20260915b"></script>
-  <script src="src/scores.js?v=20260915b"></script>
-  <script src="src/collect.js?v=20260915b"></script>
+  <script src="src/cloud.js?v=20260915d"></script>
+  <script src="src/llm.js?v=20260915d"></script>
+  <script src="src/store.js?v=20260915d"></script>
+  <script src="src/seed.js?v=20260915d"></script>
+  <script src="src/auth.js?v=20260915d"></script>
+  <script src="src/charts.js?v=20260915d"></script>
+  <script src="src/ai.js?v=20260915d"></script>
+  <script src="src/icons.js?v=20260915d"></script>
+  <script src="src/notices.js?v=20260915d"></script>
+  <script src="src/scores.js?v=20260915d"></script>
+  <script src="src/collect.js?v=20260915d"></script>
   <!-- 班级共享资料库（老师上传 → 全班可学；资料上云，解析与学习记录仍留本机） -->
-  <script src="src/materials.js?v=20260915b"></script>
+  <script src="src/materials.js?v=20260915d"></script>
   <!-- 复习引擎（review-helper 模块零改动移植，注册 window.RH；配 config.js 的 RH_CONFIG 别名）：
        顺序严格依次：rules → tokenizer → newword → keywords → textrank → selection
        → semantic → sm2 → storage → quiz → summarize → quizgen → llm → exporter → parsers → pipeline -->
-  <script src="src/review/rules.js?v=20260915b"></script>
-  <script src="src/review/tokenizer.js?v=20260915b"></script>
-  <script src="src/review/newword.js?v=20260915b"></script>
-  <script src="src/review/keywords.js?v=20260915b"></script>
-  <script src="src/review/textrank.js?v=20260915b"></script>
-  <script src="src/review/selection.js?v=20260915b"></script>
-  <script src="src/review/semantic.js?v=20260915b"></script>
-  <script src="src/review/sm2.js?v=20260915b"></script>
-  <script src="src/review/storage.js?v=20260915b"></script>
-  <script src="src/review/quiz.js?v=20260915b"></script>
-  <script src="src/review/summarize.js?v=20260915b"></script>
-  <script src="src/review/quizgen.js?v=20260915b"></script>
-  <script src="src/review/llm.js?v=20260915b"></script>
-  <script src="src/review/exporter.js?v=20260915b"></script>
-  <script src="src/review/parsers.js?v=20260915b"></script>
-  <script src="src/review/pipeline.js?v=20260915b"></script>
+  <script src="src/review/rules.js?v=20260915d"></script>
+  <script src="src/review/tokenizer.js?v=20260915d"></script>
+  <script src="src/review/newword.js?v=20260915d"></script>
+  <script src="src/review/keywords.js?v=20260915d"></script>
+  <script src="src/review/textrank.js?v=20260915d"></script>
+  <script src="src/review/selection.js?v=20260915d"></script>
+  <script src="src/review/semantic.js?v=20260915d"></script>
+  <script src="src/review/sm2.js?v=20260915d"></script>
+  <script src="src/review/storage.js?v=20260915d"></script>
+  <script src="src/review/quiz.js?v=20260915d"></script>
+  <script src="src/review/summarize.js?v=20260915d"></script>
+  <script src="src/review/quizgen.js?v=20260915d"></script>
+  <script src="src/review/llm.js?v=20260915d"></script>
+  <script src="src/review/exporter.js?v=20260915d"></script>
+  <script src="src/review/parsers.js?v=20260915d"></script>
+  <script src="src/review/pipeline.js?v=20260915d"></script>
   <!-- 复习视图（CA 原生 UI，调用 RH.* 引擎）：注册 CA.views.review，须在 app.js 之前 -->
-  <script src="src/review-view.js?v=20260915b"></script>
+  <script src="src/review-view.js?v=20260915d"></script>
   <!-- 登录壳（登录页 + 强制改密页；依赖 cloud.js/auth.js，须在 app.js 之前） -->
-  <script src="src/login-view.js?v=20260915b"></script>
+  <script src="src/login-view.js?v=20260915d"></script>
   <!-- 留言视图（学生留言 / 老师回复）：注册 CA.views.messages，须在 app.js 之前 -->
-  <script src="src/messages.js?v=20260915b"></script>
-  <script src="src/app.js?v=20260915b"></script>
+  <script src="src/messages.js?v=20260915d"></script>
+  <script src="src/app.js?v=20260915d"></script>
 </body>
 </html>

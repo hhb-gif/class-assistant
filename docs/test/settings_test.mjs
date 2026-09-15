@@ -1,7 +1,7 @@
 // 设置页自测（WS-D：班级成员管理 / 账号管理 / 数据管理）
 // 运行：node docs/test/settings_test.mjs（在 class-assistant 目录下）
 // 零依赖：极简 DOM 桩 + mock（异步）CA.store / CA.auth / CA.ai / CA.llm / CA.cloud / CA.util
-// 覆盖：管理员名单增删改（含级联删 scores）、学生无入口、账号管理（probe / 密码规则 / create / resetPassword）、
+// 覆盖：管理员名单增删改（含级联删 scores）、学生无入口、账号管理（App 内不提供建号/重置，仅中性说明）、
 //       数据管理（真实导出 JSON / 两级确认重置）。
 import path from "path";
 import { fileURLToPath } from "url";
@@ -267,6 +267,7 @@ const seed = {
 
 const storeCalls = [];
 const db = clone(seed);
+const removeFailColls = {};   // 模拟指定集合删除被 RLS 静默过滤
 let uidCounter = 0;
 CA.store = {
   _db: db,
@@ -296,6 +297,10 @@ CA.store = {
   },
   remove(c, id) {
     storeCalls.push({ op: "remove", coll: c, id });
+    // 模拟 RLS 静默过滤：置位后该表删除失败（与 store.remove 回读校验后的抛错文案一致）
+    if (removeFailColls[c]) {
+      return Promise.reject(new Error("删除 " + c + " 失败：操作未生效（无权限，或该记录已被行级安全策略拒绝）"));
+    }
     const l = db[c] || [];
     for (let i = 0; i < l.length; i++) if (l[i].id === id) { l.splice(i, 1); return Promise.resolve(true); }
     return Promise.resolve(false);
@@ -309,6 +314,7 @@ CA.store = {
 
 const authUsers = {
   admin: { id: "uid_admin", name: "王老师", role: "superAdmin", memberId: null, studentNo: "", mustChangePassword: false },
+  committee: { id: "uid_committee", name: "陈班委", role: "admin", memberId: null, studentNo: "", mustChangePassword: false },
   student: { id: "uid_a", name: "李思远", role: "member", memberId: "m_a", studentNo: "20230301", mustChangePassword: false },
 };
 let currentUser = authUsers.admin;
@@ -324,22 +330,16 @@ CA.ai = { enabled() { return true; }, info() { return { model: "deepseek-v4-flas
 CA.llm = { ready() { return true; } };
 CA.util = { fmtDate: () => "2026-09-15" };
 
-// 云函数桩：记录调用参数；probe / create / resetPassword 返回可控结果
-const fnCalls = [];
+// 云函数桩：probe 返回可控结果（App 内已隐藏建号/重置入口，故不再断言 create/resetPassword）
 let probeReply = { ok: true };
-let createReply = { ok: true, data: { uid: "uid_new" } };
-let resetPwdReply = { ok: true };
 CA.cloud = {
   init() {},
   ready() { return true; },
   lastError() { return null; },
   app: {
     callFunction(o) {
-      fnCalls.push(clone(o));
       const action = o && o.data && o.data.action;
       if (action === "probe") return Promise.resolve({ result: clone(probeReply) });
-      if (action === "create") return Promise.resolve({ result: clone(createReply) });
-      if (action === "resetPassword") return Promise.resolve({ result: clone(resetPwdReply) });
       return Promise.resolve({ result: { ok: true } });
     },
   },
@@ -405,8 +405,8 @@ function formInput(form, name) { return form.querySelector('[name="' + name + '"
   ok(view.querySelector("table") !== null, "管理员可见班级名单表格");
   ok(allByText(view.querySelectorAll(".head-actions .btn"), "新增成员").length === 1, "存在「新增成员」入口");
   ok(view.textContent.indexOf("2 人") >= 0, "名单人数显示 2 人");
-  ok(byText(view.querySelectorAll(".acct-cell .btn"), "重置密码") !== undefined, "已绑定成员显示「重置密码」");
-  ok(byText(view.querySelectorAll(".acct-cell .btn"), "创建账号") !== undefined, "未绑定成员显示「创建账号」");
+  ok(view.querySelector(".settings-alert.info") !== null, "显示账号中性说明条（管理员统一导入）");
+  ok(view.querySelectorAll(".acct-cell .btn").length === 0, "账号列不渲染建号/重置按钮（App 内不提供）");
   ok(view.textContent.indexOf("未建账号") >= 0, "未绑定成员标注「未建账号」");
 
   console.log("\n== B. 学生：无管理入口 ==");
@@ -416,6 +416,17 @@ function formInput(form, name) { return form.querySelector('[name="' + name + '"
   ok(view.querySelector(".head-actions") === null, "学生不渲染名单管理卡");
   ok(view.textContent.indexOf("重置数据") < 0, "学生看不到「重置数据」");
   ok(view.textContent.indexOf("导出数据 JSON") >= 0, "学生仍可导出自己的数据");
+
+  console.log("\n== B2. 班委(admin)：不渲染「重置数据」（仅超管可见） ==");
+  currentUser = authUsers.committee;
+  view = await mountSettings();
+  ok(CA.auth.isAdmin() === true && CA.auth.isSuperAdmin() === false, "班委 isAdmin=true / isSuperAdmin=false");
+  ok(byText(view.querySelectorAll(".btn"), "重置数据") == null, "班委不渲染「重置数据」按钮");
+  ok(view.textContent.indexOf("仅超级管理员可用") >= 0, "班委看到「仅超级管理员可用」说明");
+  ok(view.textContent.indexOf("导出数据 JSON") >= 0, "班委仍可导出数据");
+  currentUser = authUsers.admin;
+  view = await mountSettings();
+  ok(byText(view.querySelectorAll(".btn"), "重置数据") != null, "超级管理员看到「重置数据」按钮");
 
   console.log("\n== C. 新增成员：参数与刷新 ==");
   currentUser = authUsers.admin;
@@ -538,72 +549,29 @@ function formInput(form, name) { return form.querySelector('[name="' + name + '"
   ok((db.users || []).length >= 1, "重置保留 users");
   ok(lastToast().indexOf("已清空") >= 0, "重置结果 toast 汇总：" + lastToast());
 
-  console.log("\n== J. 账号服务：probe NO_CREDENTIAL ==");
+  console.log("\n== I2. 重置失败被如实上报（RLS 静默过滤） ==");
+  currentUser = authUsers.admin;
+  probeReply = { ok: true };
+  (db.notices = db.notices || []).push({ id: "n_fail", title: "删不掉的通知" });
+  removeFailColls.notices = true;
+  global.confirm = () => true;
+  global.prompt = () => "重置";
+  storeCalls.length = 0;
+  view = await mountSettings();
+  click(byText(view.querySelectorAll(".btn"), "重置数据"));
+  await flush(80);
+  ok(lastToast().indexOf("失败") >= 0 && lastToast().indexOf("notices") >= 0, "删除被 RLS 拒绝时如实上报失败：" + lastToast());
+  ok((db.notices || []).some((n) => n.id === "n_fail"), "被拒的通知仍在（未被静默当成功）");
+  removeFailColls.notices = false;
+
+  console.log("\n== J. 账号服务：App 内不提供建号（中性说明） ==");
   probeReply = { ok: false, code: "NO_CREDENTIAL", message: "缺少环境变量：TC_SECRET_ID, TCB_API_KEY" };
   view = await mountSettings();
-  const alert = view.querySelector(".settings-alert");
-  ok(alert !== null, "显示账号服务提示条");
-  ok(alert.textContent.indexOf("TC_SECRET_ID") >= 0, "提示列出缺失环境变量");
-  const createBtns = allByText(view.querySelectorAll(".acct-cell .btn"), "创建账号");
-  ok(createBtns.length >= 1 && createBtns.every((b) => b.disabled === true), "缺凭证时建号按钮 disabled");
-
-  console.log("\n== K. 创建账号：密码规则 + create 参数 ==");
-  probeReply = { ok: true };
-  createReply = { ok: true, data: { uid: "uid_new" } };
-  view = await mountSettings();
-  const cbtn = byText(view.querySelectorAll(".acct-cell .btn"), "创建账号");
-  ok(cbtn.disabled === false, "凭证就绪时建号按钮可用");
-  click(cbtn);
-  await flush();
-  form = modalBox().querySelector("form");
-  const pwd = formInput(form, "password");
-  ok(pwd.value === "20230302", "初始密码默认填学号");
-  fnCalls.length = 0;
-  dispatch(form, { type: "submit" });
-  await flush();
-  ok(!fnCalls.some((c) => c.data.action === "create"), "纯学号密码被前端拦截，不调用云函数");
-  ok(lastToast().indexOf("8–32") >= 0, "密码规则提示可读");
-
-  pwd.value = "Abc12345";
-  fnCalls.length = 0;
-  dispatch(form, { type: "submit" });
-  await flush();
-  const ccall = fnCalls.filter((c) => c.data.action === "create").pop();
-  ok(!!ccall, "合法密码后调用 create");
-  ok(ccall.name === "admin-user", "云函数名 admin-user");
-  ok(ccall.data.studentNo === "20230302" && ccall.data.displayName.indexOf("张天宇") === 0, "create 参数 学号/姓名 正确");
-  ok(ccall.data.password === "Abc12345", "create 参数 密码 正确");
-  ok(lastToast().indexOf("账号已创建") >= 0, "create 成功 toast");
-
-  console.log("\n== L. 创建账号：ok:false 原样透传 ==");
-  probeReply = { ok: true };
-  createReply = { ok: false, code: "UPSTREAM", message: "体验版用户数已达上限" };
-  view = await mountSettings();
-  click(byText(view.querySelectorAll(".acct-cell .btn"), "创建账号"));
-  await flush();
-  form = modalBox().querySelector("form");
-  formInput(form, "password").value = "Abc12345";
-  dispatch(form, { type: "submit" });
-  await flush();
-  ok(lastToast().indexOf("体验版用户数已达上限") >= 0, "ok:false 的 message 原样 toast");
-
-  console.log("\n== M. 重置密码 ==");
-  db.members.push({ id: "m_a", name: "李思远", studentNo: "20230301" });   // 还原绑定成员
-  probeReply = { ok: true };
-  resetPwdReply = { ok: true };
-  view = await mountSettings();
-  const rp = byText(view.querySelectorAll(".acct-cell .btn"), "重置密码");
-  ok(rp !== undefined, "已绑定成员显示「重置密码」");
-  click(rp);
-  await flush();
-  form = modalBox().querySelector("form");
-  formInput(form, "password").value = "Abc12345";
-  fnCalls.length = 0;
-  dispatch(form, { type: "submit" });
-  await flush();
-  const rcall = fnCalls.filter((c) => c.data.action === "resetPassword").pop();
-  ok(!!rcall && rcall.data.uid === "uid_a" && rcall.data.password === "Abc12345", "resetPassword 参数 uid/password 正确");
-  ok(lastToast().indexOf("密码已重置") >= 0, "重置密码成功 toast");
+  const alert = view.querySelector(".settings-alert.info");
+  ok(alert !== null, "显示中性说明条 (.settings-alert.info)");
+  ok(alert.textContent.indexOf("管理员统一导入") >= 0, "说明文案提到管理员统一导入");
+  ok(alert.textContent.indexOf("TC_SECRET_ID") < 0, "不暴露技术细节 TC_SECRET_ID");
+  ok(view.querySelectorAll(".acct-cell .btn").length === 0, "名单账号列不渲染建号/重置按钮");
 
   console.log("\n========================================");
   console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过"}`);
