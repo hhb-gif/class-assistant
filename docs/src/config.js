@@ -1,4 +1,4 @@
-﻿// LLM 通道单点配置 · 云函数网关（前端零密钥）
+// LLM 通道单点配置 · 云函数网关（前端零密钥）
 // P3 迁移：原计划 (A) CloudBase 内置 AI —— 因环境为「体验版」，套餐不支持内置 AI（UpdateAIModel 被拒）
 //   且无 Token 资源包，故改为方案 (B)：前端经 CloudBase 云函数 `ai-gateway` 转发外部 OpenAI 兼容通道。
 //   外部 AI 密钥只存云函数环境变量（AI_BASE_URL / AI_API_KEY / AI_MODEL），前端零密钥。

@@ -27,6 +27,13 @@
 
 > 验收补充（新环境）：老师/学生双角色、成绩（30/15，RLS 生效）、收集（统计/文本回答/未交名单）、通知（置顶徽标）、资料库、留言、AI（`连接成功`）均通过。
 
+### 迁移补正（2026-09-15 收尾）
+- **通知写策略迁移曾漏应用**：`20260915010400_notices_admin_only_update` 在重放时只落了 8 条，新环境 `notices_update`/`notices_delete` 仍是旧策略（`publisher_id = auth.uid() or app.is_super_admin()`，缺 `app.is_admin()` 前置），相对旧环境属**安全回归**。本次以 `includeAll=true` **乱序补应用**，复验两策略 `qual` 均含 `app.is_admin()`，迁移历史共 **9 条**。
+- **`notices.publisher_id` 重映射**：原为旧环境 uid（`2099452365032161282`，新环境无此 uid）→ 更新为新 teacher uid `2099862936471105538`（王老师/superAdmin），共 2 行。
+- `admin-user`：与旧环境一致**保持未启用**（不配 CAM 密钥，`probe` 返回 `NO_CREDENTIAL`）。
+- 旧环境附件**孤儿对象不搬**（维持现状）。
+- 前端 `?v=20260915a` → `?v=20260915b` 并重部署静态托管；本地 8 个测试合计 **799** 断言全绿（store 88 + notices 158 + scores 148 + collect 131 + review 68 + messages 43 + materials 89 + settings 74）。
+
 ---
 
 ## 目标
