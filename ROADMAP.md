@@ -1,6 +1,6 @@
 # ROADMAP.md · 班级管家 全局路线图
 
-> 版本：v1.0 ｜ 日期：2026-09-14 ｜ 状态：**已确认，待执行**
+> 版本：v1.10 ｜ 日期：2026-09-15 ｜ 状态：**已确认，待执行**
 > 上游：**[GOALS.md](GOALS.md)**（愿景书，部分已过时）、**[CONTRACT.md](CONTRACT.md)**（原型开发契约）、**[DESIGN.md](DESIGN.md)**（UI 规范）、**[REVIEW.md](REVIEW.md)**（复习整合契约）
 >
 > **本文件是当前权威执行计划。与 GOALS.md 冲突时，以本文为准。**（GOALS.md 描述的是「小程序 + 分四期」的原始设想，本文记录实际战略转向。）
@@ -70,6 +70,9 @@
 | D7 | 内容安全 | **Web 阶段暂缓，人工重审；上线前补方案** | Web 端无微信 msgSecCheck，试用期范围可控 | 09-14 |
 | D8 | 重构策略 | **彻底异步化**（store 接口返回 Promise） | 无脏读/冲突隐患，一次到位 | 09-14 |
 | D9 | 部署 | **CloudBase 静态托管**（前后端同源打通） | 接后端后 GH Pages 不再适用 | 09-14 |
+| D10 | 匿名收集 | **方案 B：独立匿名表 + PG 函数 RPC**（连管理员也读不到明细） | 要的是真匿名；纯前端隐藏 = 掩耳盗铃 | 09-15 |
+| D11 | 复习资料 | **资料上云共享，学习记录仍留本机**（修正 D4 的边界表述） | 老师要发资料给全班，但个人学习隐私与体积不应上云 | 09-15 |
+| D12 | 写权限口径 | **所有业务表的写策略都必须先过 `app.is_admin()`**；UPDATE/DELETE 前端的「成功」必须靠**回读校验**确认 | `notices` 曾漏掉 admin 前置（按 publisher_id 授权），且 RLS 静默过滤会被前端当成功 | 09-15 |
 
 > 备选方案与否决理由见附录 A（后端选型对比）。
 
@@ -106,11 +109,14 @@
 | 身份 | `users` `members` `invite_codes` | uid 绑定角色；名单 30 人；一次性邀请码 |
 | 通知 | `notices` `favorites` `subscribers` | 通知+附件元数据+链接；收藏；订阅 |
 | 成绩 | `exams` `subjects` `scores` | 成绩按 `member_id` 关联，不存多余个人信息 |
-| 收集 | `surveys` `survey_items` `survey_submissions` | 问卷/接龙/报名与提交 |
+| 收集 | `surveys` `responses` `survey_anonymous_responses` | 问卷/接龙/报名与提交；**匿名提交独立表（无 member_id，只存加盐 token 哈希）** |
+| 资料 | `class_materials` | 班级共享资料的元数据（文件本体在云存储） |
 | 审计 | `operation_logs` `ai_usage_logs` `security_counters` `feedbacks` | 操作审计、AI 用量、限流、反馈 |
 | ~~复习~~ | ~~`review_cards`~~ 等 | **不建**（D4，复习留本机） |
 
 > DDL 一律走 `managePgDatabase(action=applyMigration)`，本地文件 `cloudbase/migrations/<version>_<name>.sql`（14 位时间戳版本号）。
+> ⚠️ **迁移执行器按分号切分语句**：`$$ ... $$` 函数体内不得出现分号，函数必须写成 `language sql` 单条语句
+> （用 `CASE`/CTE/子查询表达分支）。血泪教训见 [故障记录/2026-09-15-PG迁移函数体分号截断.md](故障记录/)。
 
 ### 4.3 认证与权限（CloudBase Auth + RLS）
 
@@ -121,11 +127,23 @@
 
 | 表 | SELECT | INSERT / UPDATE / DELETE |
 |----|--------|--------------------------|
-| `notices` | 已登录用户 | 发布者本人或 admin/superAdmin |
+| `notices` | 已登录用户 | 三条写策略**都必须先过 `app.is_admin()`**（20260915010400 收紧）：INSERT 仅管理员；UPDATE/DELETE 普通管理员限自己发布的、超级管理员全部。**非管理员即使 `publisher_id` 等于自己也被拒** |
 | `scores` | 管理员全部；学生**仅自己 member_id** | 仅 admin/superAdmin |
 | `surveys` | 已登录用户 | 仅 admin/superAdmin |
-| `survey_submissions` | 提交者本人或 admin | 提交者本人（未截止） |
-| 敏感/复杂操作 | —— | 一律走云函数（`service_role` 绕过 RLS）服务端校验 |
+| `responses` | 提交者本人或 admin（**仅非匿名问卷**） | 提交者本人（未截止） |
+| `class_materials` | 已登录用户（全班可读） | 仅 admin/superAdmin |
+| `survey_anonymous_responses` | **无策略 = deny all**（管理员也读不到） | 无策略；只经 `app.submit_anonymous()`（security definer）写入 |
+| 敏感/复杂操作 | —— | 一律走云函数 / PG 函数（security definer）服务端校验 |
+
+> ⚠️ **RLS 的静默失败**：UPDATE/DELETE 被策略过滤时，PostgREST 返回的是「0 行受影响、无 error」。
+> 前端必须**回读校验**，否则会把越权操作当成功（历史上 `notices.js` 就会弹「已更新/已删除」）。
+> 见 §3 D12。
+
+> **匿名收集（D10，方案 B：PG 函数 + RPC）**：`survey_anonymous_responses` 启用 RLS 且**零策略**，
+> 表内只存 `md5(盐 ‖ 随机token)`，不存 `member_id`/`uid`。读写只能经
+> `app.submit_anonymous` / `app.my_anonymous` / `app.anon_summary`（`security definer`，属主绕过 RLS），
+> 管理端仅得聚合票数。代价（已接受）：老师无法催交、无「已交/未交」进度、学生换设备可能重复提交一次。
+> token 只存学生本机 `localStorage`。
 
 ---
 
@@ -158,6 +176,23 @@
 - **目标**：老师与真实学生可用。
 - **内容**：CloudBase 静态托管 + 自定义域名（如需）；隐私协议；真实种子数据；三角色 × 五视图端到端验收。
 - **验收**：对齐 GOALS M1/M2/M3 的「真实使用」标准。
+
+### P5 · 真交互补齐 **[已完成]**
+> 触发：用户实测发现「添加选项点了没反应」「勾了匿名还能看到谁没交」——即 UI 有入口但功能是假的。
+- **背景**：盘点发现「上传 / 下发 / 增加」类入口真伪混杂（附件上传是真的，但设置页导出/重置、
+  账号管理、考试/科目新增、匿名全是假的或缺的）。
+- **内容**：
+  1. **匿名收集**（D10 方案 B，PG 函数 + RPC）——见 §4.3。
+  2. **班级共享资料库**（D11，新表 `class_materials` + 复用 `attachments` 桶；老师上传 → 全班可下载 →
+     学生「加入我的复习」交本机 RH 引擎解析）。**修订 D4 边界**：上云的是**资料文件**，
+     复习记录与解析结果仍只留本机 IndexedDB，D4 未被破坏。
+  3. **成员 / 账号管理**：设置页成员增删改（RLS 已允许管理员）；`admin-user` 云函数
+     （`probe`/`list`/`create`/`resetPassword`）走管控面 `tcb:CreateUser` + `exec-pgsql` 写 `users`。
+  4. **数据管理修真**：导出改为逐集合读 PG；重置改为真删业务表（保留 members/users，双重确认）。
+  5. **Bug 修**：`collect.js` 在 `querySelectorAll()` 结果上直接 `.map()`（NodeList 没有 map），
+     导致「添加选项/添加题目/保存」全部静默中断；单测的 DOM 桩返回真数组所以没抓到 —— 桩已改为类 NodeList。
+- **验收**：8 个 node 测试套件全绿（784 断言）；迁移已应用并校验；`admin-user` 已部署。
+  ⏳ 未做：浏览器真机点验匿名 RPC 与建号（见 §9 待决）。
 
 ---
 
@@ -210,18 +245,27 @@
 | 🎨 UI v4.1 | **Rounded Neo-brutalism** + **和谐化配色**（墨蓝 `#2B4ACB` + 陶土橙 `#CF5A1C` + 奶油底）；Agnes 插画按新色板重出 7 张；角色差异化；见 `DESIGN.md` |
 | ✅ P2 | 复习 Tab = **CA 原生 UI（v4）+ RH 引擎**（弃用 RH 整页 iframe，`docs/rh` 已删）；复习 AI 走 CloudBase 网关 |
 | ✅ P3 | AI 网关 = 云函数 `ai-gateway` → DeepSeek（免前端密钥）；**线上实测可用**（`testConnection` / `parseNotice` 通过） |
+| ✅ P5 · 迁移 | 新增三条：`20260915010200_class_materials`、`20260915010300_survey_anonymous`、`20260915010400_notices_admin_only_update`（均已 apply + 校验） |
+| ✅ P5 · 云函数 | `admin-user`（账号管理）已部署，`InstallDependency=TRUE`、Status Active、**环境变量为空**（未配则 `probe` 返回 `NO_CREDENTIAL`） |
+| ⚠️ 建号前置 | `admin-user` 需配 `TC_SECRET_ID` / `TC_SECRET_KEY`（tcb 管控面）+ `TCB_ENV_ID` + `TCB_API_KEY`（exec-pgsql 写 `users`）；**体验版用户上限 3 已满**（`administrator`/`teacher`/`20230301`），建号现在必失败 |
+| 📌 迁移约束 | 迁移执行器按 `;` 切分：**`$$` 函数体内不得有分号**，用 `language sql` 单语句 + `CASE`/CTE 表达（详见故障记录 2026-09-15） |
+| 🔒 匿名数据 | `survey_anonymous_responses` RLS 零策略（deny all）；读写仅经 `app.submit_anonymous` / `my_anonymous` / `anon_summary`（+ `public` 同名包装层给 PostgREST 命中） |
 | ⚠️ 部署缓存 | 静态托管边缘会缓存 JS；`index.html` 本地资源统一带 `?v=<版本>`，**每次部署须 bump 版本号** |
 | 🌐 访问地址① | `https://class-assistant-d6fw1gdce84d261e-1485216264.tcloudbaseapp.com/`（静态托管默认域） |
 | 🌐 访问地址② | `https://class-assistant-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`（webapps 子域，`*.webapps.tcloudbase.com` 已在安全域名白名单）✅ |
 | 🌐 访问地址③ | `https://app-class-assistant-d6fw1gdce84d261e.webapps.tcloudbase.com/`（**短子域，推荐**，服务名 `app`）✅ |
 | 🔑 密钥 | DeepSeek Key 存于云函数环境变量 `AI_API_KEY`（不入库）；**建议使用后轮换** |
+| 🗑️ 已清理 | 静态托管里遗留的 `rh/`（弃用的 RH iframe 副本）已删除 |
 
 ## 9. 待决问题
 
-- [ ] P2 复习界面「抄 RH」的精确形态：整体复制 RH 页 vs 移植其 UI 层
+- [x] P2 复习界面「抄 RH」的精确形态 → 定为 **CA 原生 UI + RH 引擎**（v1.5 已落地）
 - [ ] 是否需要自定义域名（涉及备案）
 - [ ] 上线前内容安全的具体方案选型
 - [ ] 初始密码策略细节（改密入口、忘记密码找回方式）
+- [ ] **`admin-user` 的 CAM 密钥 + `TCB_API_KEY` 是否配置**；体验版用户上限 3 需升配套餐
+- [ ] **浏览器真机点验**：匿名问卷提交/回显/聚合、班级资料上传下载、成员增删改、账号建号
+- [ ] `admin-user` 的 `resetPassword` 用的 `ModifyUser` 参数名**未验证**（仅按文档对称推断）
 
 ---
 
@@ -239,6 +283,8 @@
 | 2026-09-14 | v1.6 | 应用户反馈：`.card-ink` 黑底→主色蓝；复习减少框嵌套（4→2 卡）；精简「演示」等废话文案；**新增「留言」Tab**（学生→老师，含回复闭环）；**通知附件真上传/下载** + 存储 RLS；浏览器实测通过 |
 | 2026-09-14 | v1.7 | 移除「高二(3)班」文案；**新增 webapps 子域**并实测登录可用；**移动端适配**（底部 6 项导航/紧凑顶栏/响应式卡片，390px 实测）；git 提交推送 |
 | 2026-09-14 | v1.8 | 修复 index.html 漏载 `collect.js`（收集恢复）；新增**短子域** `app-…`；通知/收集**点按收起**（toggle，`aria-expanded` 同步） |
+| 2026-09-15 | v1.9 | **P5 真交互补齐**：① 修 `collect.js` NodeList `.map` bug（添加选项/题目/保存全部失效）；② **匿名收集 = 真匿名**（D10 方案 B：PG 函数 + RPC、零策略 deny all、加盐 token 哈希）；③ **班级共享资料库**（D11，新表 `class_materials`，老师上传→全班可学，资料上云而学习记录仍留本机）；④ 设置页**成员增删改 + 账号管理 + 真实导出/重置**，新增云函数 `admin-user`；⑤ 新增「资料」Tab（7 项导航）；⑥ 发现并记录**迁移函数体分号截断**约束；测试 542 → **784** 断言，全部通过 |
+| 2026-09-15 | v1.10 | **修「学生也能改通知」**：定位到 `notices` 是全库唯一「UPDATE/DELETE 策略没强制 `app.is_admin()`」的表（原按 `publisher_id = auth.uid()` 授权），迁移 `20260915010400` 收紧为「管理员 AND（超管 或 发布者本人）」；前端 `canManage()` 改为**先判管理员能力再比 publisherId**（堵住 `undefined === undefined` 退化）；并补**写后回读校验** —— RLS 静默过滤（0 行受影响、无 error）不再被当成功（D12）。浏览器侧核对：`notices_test` 学生角色改为真实值 `member` + 新增 15 条权限/静默拦截断言；测试 784 → **799** 全绿 |
 
 ---
 

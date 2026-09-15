@@ -168,19 +168,21 @@ function visibleScores() {
     ? (db.scores || []).filter((s) => s.memberId === STUDENT_MEMBER_ID)
     : (db.scores || []);
 }
+const storeCalls = []; // 写操作调用日志（新增/更新/删除/筛选），用于断言参数与顺序
 CA.store = {
   get(coll) {
     if (coll === "scores") return Promise.resolve(copyArr(visibleScores()));
     return Promise.resolve(copyArr(db[coll] || []));
   },
   query(coll, fn) {
+    storeCalls.push({ op: "query", coll });
     if (coll === "scores") return Promise.resolve(visibleScores().filter(fn).map((x) => Object.assign({}, x)));
     return Promise.resolve((db[coll] || []).filter(fn).map((x) => Object.assign({}, x)));
   },
   find(coll, id) { const x = (db[coll] || []).find((i) => i.id === id); return Promise.resolve(x ? Object.assign({}, x) : null); },
-  add(coll, obj) { const o = Object.assign({ id: "gen_" + (++uid), createdAt: "t" }, obj); (db[coll] = db[coll] || []).push(o); return Promise.resolve(Object.assign({}, o)); },
-  update(coll, id, patch) { const x = (db[coll] || []).find((i) => i.id === id); if (!x) return Promise.resolve(null); Object.assign(x, patch); return Promise.resolve(Object.assign({}, x)); },
-  remove(coll, id) { const i = (db[coll] || []).findIndex((x) => x.id === id); if (i < 0) return Promise.resolve(false); db[coll].splice(i, 1); return Promise.resolve(true); },
+  add(coll, obj) { storeCalls.push({ op: "add", coll, obj: Object.assign({}, obj) }); const o = Object.assign({ id: "gen_" + (++uid), createdAt: "t" }, obj); (db[coll] = db[coll] || []).push(o); return Promise.resolve(Object.assign({}, o)); },
+  update(coll, id, patch) { storeCalls.push({ op: "update", coll, id, patch: Object.assign({}, patch) }); const x = (db[coll] || []).find((i) => i.id === id); if (!x) return Promise.resolve(null); Object.assign(x, patch); return Promise.resolve(Object.assign({}, x)); },
+  remove(coll, id) { storeCalls.push({ op: "remove", coll, id }); const i = (db[coll] || []).findIndex((x) => x.id === id); if (i < 0) return Promise.resolve(false); db[coll].splice(i, 1); return Promise.resolve(true); },
   uid(prefix) { return (prefix || "id") + "_" + (++uid).toString(36); },
   memberName(id) { const m = (db.members || []).find((x) => x.id === id); return m ? m.name : ""; },
   settings() { return { aiEnabled: true }; },
@@ -442,6 +444,206 @@ aiOn = true;
 let uErr = null;
 try { CA.views.scores.unmount(); } catch (e) { uErr = e; }
 ok("unmount 不抛错", !uErr, uErr && uErr.message);
+
+// ============================================================
+console.log("\n[6] 考试管理（admin：新增/编辑/删除 + 下拉回退）");
+// ============================================================
+// 递归收集元素文本（FakeEl 的行是元素节点，innerHTML 为空）
+function collectText(el) {
+  if (!el) return "";
+  let s = el.textContent || "";
+  (el.children || []).forEach((c) => { s += " " + collectText(c); });
+  return s;
+}
+role = "admin";
+aiOn = true;
+resetScores();
+globalThis.window.confirm = () => true; // 删除二次确认自动通过
+
+const aroot = new FakeEl("section");
+let aErr = null;
+try { await CA.views.scores.mount(aroot); } catch (e) { aErr = e; }
+ok("管理视图 mount 不抛错", !aErr, aErr && aErr.stack);
+ok("存在考试管理入口 #btn-exam-manage", !!aroot.querySelector("#btn-exam-manage"));
+ok("存在科目管理入口 #btn-subject-manage", !!aroot.querySelector("#btn-subject-manage"));
+ok("存在考试管理面板", !!aroot.querySelector("#exam-manage-panel"));
+ok("存在科目管理面板", !!aroot.querySelector("#subject-manage-panel"));
+
+aroot.querySelector("#btn-exam-manage").dispatch("click");
+ok("点击后考试面板显示", aroot.querySelector("#exam-manage-panel").hidden === false);
+ok("考试列表渲染已录成绩计数", (collectText(aroot.querySelector("#exam-manage-list")).match(/已录成绩/g) || []).length >= 3);
+
+// --- 新增考试 ---
+storeCalls.length = 0;
+aroot.querySelector("#btn-exam-add").dispatch("click");
+ok("新增考试表单显示", aroot.querySelector("#exam-manage-form").hidden === false);
+aroot.querySelector("#exam-name-input").value = "第三次月考";
+aroot.querySelector("#exam-date-input").value = "2026-06-10";
+aroot.querySelector("#btn-exam-save").dispatch("click");
+await tick(30);
+const addExam = storeCalls.find((c) => c.op === "add" && c.coll === "exams");
+ok("新增考试调用 store.add(exams)", !!addExam);
+ok("新增考试参数含名称/日期",
+  addExam && addExam.obj.name === "第三次月考" && addExam.obj.date === "2026-06-10",
+  addExam && JSON.stringify(addExam.obj));
+ok("新增考试 id 前缀 ex", addExam && /^ex/.test(String(addExam.obj.id)), addExam && addExam.obj.id);
+ok("新增考试落库", db.exams.some((e) => e.name === "第三次月考" && e.date === "2026-06-10"));
+ok("新增后考试下拉同步刷新",
+  collectText(aroot.querySelector("#exam-select")).indexOf("第三次月考") >= 0);
+
+// --- 编辑考试 ---
+storeCalls.length = 0;
+aroot.querySelector("#btn-exam-edit-e1").dispatch("click");
+ok("编辑表单预填名称", aroot.querySelector("#exam-name-input").value === "第一次月考");
+ok("编辑表单预填日期", aroot.querySelector("#exam-date-input").value === "2026-03-15");
+aroot.querySelector("#exam-name-input").value = "第一次月考（修订）";
+aroot.querySelector("#exam-date-input").value = "2026-03-16";
+aroot.querySelector("#btn-exam-save").dispatch("click");
+await tick(30);
+const updExam = storeCalls.find((c) => c.op === "update" && c.coll === "exams");
+ok("编辑考试调用 store.update(exams)", !!updExam && updExam.id === "e1", updExam && updExam.id);
+ok("编辑考试参数正确",
+  updExam && updExam.patch.name === "第一次月考（修订）" && updExam.patch.date === "2026-03-16",
+  updExam && JSON.stringify(updExam.patch));
+ok("编辑后落库", db.exams.find((e) => e.id === "e1").name === "第一次月考（修订）");
+
+// --- 删除考试：先删 scores 再删 exams；删除当前考试后下拉回退 ---
+const examSel = aroot.querySelector("#exam-select");
+examSel.value = "e2";
+examSel.dispatch("change");
+await tick(10);
+ok("已切换到 e2", aroot.querySelector("#exam-select").value === "e2", aroot.querySelector("#exam-select").value);
+const e2Count = db.scores.filter((s) => s.examId === "e2").length;
+ok("e2 有成绩可级联", e2Count > 0, e2Count);
+
+storeCalls.length = 0;
+aroot.querySelector("#btn-exam-del-e2").dispatch("click");
+await tick(40);
+const removes = storeCalls.filter((c) => c.op === "remove");
+const examRemIdx = removes.findIndex((c) => c.coll === "exams");
+ok("删除考试先删 scores 再删 exams",
+  removes.filter((c) => c.coll === "scores").length === e2Count && examRemIdx === removes.length - 1 &&
+  removes.slice(0, examRemIdx).every((c) => c.coll === "scores"),
+  JSON.stringify(removes));
+ok("e2 成绩已清空", !db.scores.some((s) => s.examId === "e2"));
+ok("e2 考试已删除", !db.exams.some((e) => e.id === "e2"));
+const remainFirst = db.exams.slice().sort((a, b) => String(a.date).localeCompare(String(b.date)))[0].id;
+ok("删除当前考试后下拉回退到首个可用项",
+  aroot.querySelector("#exam-select").value === remainFirst,
+  aroot.querySelector("#exam-select").value + " vs " + remainFirst);
+
+// ============================================================
+console.log("\n[7] 科目管理（admin：新增/编辑/删除）");
+// ============================================================
+aroot.querySelector("#btn-subject-manage").dispatch("click");
+ok("点击后科目面板显示", aroot.querySelector("#subject-manage-panel").hidden === false);
+ok("科目列表渲染", (collectText(aroot.querySelector("#subject-manage-list")).match(/满分/g) || []).length >= 5);
+
+// --- 新增科目 ---
+storeCalls.length = 0;
+aroot.querySelector("#btn-subject-add").dispatch("click");
+ok("新增科目表单显示", aroot.querySelector("#subject-manage-form").hidden === false);
+aroot.querySelector("#subject-name-input").value = "生物";
+aroot.querySelector("#subject-full-input").value = "100";
+aroot.querySelector("#subject-order-input").value = "6";
+aroot.querySelector("#btn-subject-save").dispatch("click");
+await tick(30);
+const addSub = storeCalls.find((c) => c.op === "add" && c.coll === "subjects");
+ok("新增科目调用 store.add(subjects)", !!addSub);
+ok("新增科目字段映射 fullScore/order",
+  addSub && addSub.obj.name === "生物" && addSub.obj.fullScore === 100 && addSub.obj.order === 6,
+  addSub && JSON.stringify(addSub.obj));
+ok("新增科目 id 前缀 sub", addSub && /^sub/.test(String(addSub.obj.id)), addSub && addSub.obj.id);
+ok("新增科目落库", db.subjects.some((s) => s.name === "生物" && s.fullScore === 100 && s.order === 6));
+
+// --- 编辑科目 ---
+storeCalls.length = 0;
+aroot.querySelector("#btn-subject-edit-sub_ph").dispatch("click");
+ok("编辑科目预填满分", aroot.querySelector("#subject-full-input").value === "100");
+aroot.querySelector("#subject-name-input").value = "物理（实验）";
+aroot.querySelector("#subject-full-input").value = "120";
+aroot.querySelector("#subject-order-input").value = "40";
+aroot.querySelector("#btn-subject-save").dispatch("click");
+await tick(30);
+const updSub = storeCalls.find((c) => c.op === "update" && c.coll === "subjects");
+ok("编辑科目调用 store.update(subjects)", !!updSub && updSub.id === "sub_ph", updSub && updSub.id);
+ok("编辑科目字段映射 fullScore/order",
+  updSub && updSub.patch.name === "物理（实验）" && updSub.patch.fullScore === 120 && updSub.patch.order === 40,
+  updSub && JSON.stringify(updSub.patch));
+
+// --- 删除科目：先删 scores 再删 subjects ---
+const chCount = db.scores.filter((s) => s.subjectId === "sub_ch").length;
+ok("sub_ch 有成绩可级联", chCount > 0, chCount);
+storeCalls.length = 0;
+aroot.querySelector("#btn-subject-del-sub_ch").dispatch("click");
+await tick(40);
+const sRemoves = storeCalls.filter((c) => c.op === "remove");
+const subRemIdx = sRemoves.findIndex((c) => c.coll === "subjects");
+ok("删除科目先删 scores 再删 subjects",
+  sRemoves.filter((c) => c.coll === "scores").length === chCount && subRemIdx === sRemoves.length - 1 &&
+  sRemoves.slice(0, subRemIdx).every((c) => c.coll === "scores"),
+  JSON.stringify(sRemoves));
+ok("sub_ch 成绩已清空", !db.scores.some((s) => s.subjectId === "sub_ch"));
+ok("sub_ch 科目已删除", !db.subjects.some((s) => s.id === "sub_ch"));
+
+// ============================================================
+console.log("\n[8] 批量录入文件上传（CSV/TXT 复用解析链路；xlsx 拒绝）");
+// ============================================================
+aroot.querySelector("#btn-score-import").dispatch("click");
+ok("导入面板显示", aroot.querySelector("#score-import-panel").hidden === false);
+ok("存在文件输入 #score-import-file", !!aroot.querySelector("#score-import-file"));
+ok("存在选择文件按钮 #btn-score-file", !!aroot.querySelector("#btn-score-file"));
+
+class FakeFileReader {
+  readAsText(file) { this.result = file._text; if (this.onload) this.onload(); }
+}
+globalThis.FileReader = FakeFileReader;
+const fileIn = aroot.querySelector("#score-import-file");
+
+// --- CSV 走文本解析链路 ---
+const csvText = "20230301,数学,150";
+fileIn.files = [{ name: "scores.csv", size: 20, _text: csvText }];
+fileIn.dispatch("change");
+await tick(20);
+ok("CSV 文本写入 textarea", aroot.querySelector("#score-import-input").value === csvText);
+ok("CSV 触发解析预览",
+  aroot.querySelector("#score-import-preview").innerHTML.indexOf("可导入") >= 0,
+  aroot.querySelector("#score-import-preview").innerHTML.slice(0, 60));
+ok("CSV 解析后可确认写入", aroot.querySelector("#btn-score-confirm").hidden === false);
+
+// --- TXT 同样支持 ---
+fileIn.files = [{ name: "scores.TXT", size: 20, _text: "20230302,语文,100" }];
+fileIn.dispatch("change");
+await tick(20);
+ok("TXT 文本写入 textarea", aroot.querySelector("#score-import-input").value === "20230302,语文,100");
+
+// --- xlsx 被拒绝并清空 ---
+let tBefore = toasts.length;
+fileIn.files = [{ name: "scores.xlsx", size: 30 }];
+fileIn.dispatch("change");
+await tick(10);
+ok("xlsx 被拒绝并 toast",
+  toasts.slice(tBefore).some((t) => t.msg.indexOf("Excel") >= 0),
+  JSON.stringify(toasts.slice(tBefore)));
+ok("xlsx 后 input 清空", fileIn.value === "");
+
+// --- >2MB 被拒绝 ---
+tBefore = toasts.length;
+fileIn.files = [{ name: "big.csv", size: 3 * 1024 * 1024, _text: "x" }];
+fileIn.dispatch("change");
+await tick(10);
+ok("超大文件被拒绝",
+  toasts.slice(tBefore).some((t) => t.msg.indexOf("过大") >= 0),
+  JSON.stringify(toasts.slice(tBefore)));
+
+// --- 非 UTF-8（含替换符）被拒绝 ---
+tBefore = toasts.length;
+fileIn.files = [{ name: "gbk.csv", size: 20, _text: "20230301,数学,150\uFFFD" }];
+fileIn.dispatch("change");
+await tick(10);
+ok("非 UTF-8 编码被拒绝",
+  toasts.slice(tBefore).some((t) => t.msg.indexOf("UTF-8") >= 0 && t.msg.indexOf("暂不支持") < 0),
+  JSON.stringify(toasts.slice(tBefore)));
 
 // ============================================================
 console.log("\n============================================");

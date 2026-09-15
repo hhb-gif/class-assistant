@@ -5,9 +5,17 @@
 // 数据层：CA.store 已切 CloudBase PG（返回 Promise）；除 memberName/settings/uid 外一律 await；
 //         CA.auth.current() 亦为异步，isAdmin() 保持同步（读角色缓存）。
 // 权限：surveys 写操作仅管理员（学生被 RLS 拒 → try/catch + toast）；responses 学生读写仅本人。
+// 匿名收集：survey.anonymous = true 时走 PG 函数 + RPC（submit_anonymous / my_anonymous / anon_summary），
+//           凭据只存本机 localStorage，服务端只有加盐 md5；管理端只看聚合、拿不到未交名单。
 // 对外：CA.views.collect = { mount, unmount }
 //       CA.collect.stats(surveyId) / computeStats(surveyId) / validate(draft) / buildResponse(...) / renderMarkdown(md)
-// 依赖：CA.store / CA.auth / CA.util / CA.ai / CA.icon / CA.app（均为契约接口，缺失时安全降级）
+//                 / genAnonToken() / anonToken(surveyId)
+// 依赖：CA.store / CA.auth / CA.util / CA.ai / CA.icon / CA.app / CA.cloud（均为契约接口，缺失时安全降级）
+//
+// ⚠️ NodeList 陷阱：querySelectorAll 返回的是 NodeList，只有 length / item() / forEach，
+//    没有 .map / .filter / .slice。历史上直接 .map 会抛 TypeError 并中断整条同步链路
+//    （添加/删除选项、换题型、保存全挂）。故本文件所有 querySelectorAll 结果一律先经
+//    toArray()（内部 Array.prototype.slice.call）转成真数组再调数组方法。
 window.CA = window.CA || {};
 
 (function () {
@@ -28,6 +36,23 @@ window.CA = window.CA || {};
   }
 
   function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+
+  // NodeList（querySelectorAll 返回值）没有数组方法；统一 slice 成真数组后再操作。
+  function toArray(list) { return Array.prototype.slice.call(list || []); }
+
+  // 票数 -> 选项拆分（问卷定义顺序优先，补上定义外的自由选项）
+  function breakdownOf(counts, options) {
+    counts = counts || {};
+    var votes = 0;
+    Object.keys(counts).forEach(function (k) { votes += counts[k]; });
+    var labels = (options || []).slice();
+    Object.keys(counts).forEach(function (k) { if (labels.indexOf(k) < 0) labels.push(k); });
+    var breakdown = labels.map(function (label) {
+      var c = counts[label] || 0;
+      return { label: label, count: c, percent: votes ? round1(c / votes * 100) : 0 };
+    });
+    return { votes: votes, breakdown: breakdown };
+  }
 
   function toast(msg, type) {
     try { if (CA.app && typeof CA.app.toast === "function") CA.app.toast(msg, type); } catch (e) { /* 忽略 */ }
@@ -203,6 +228,26 @@ window.CA = window.CA || {};
     ]).then(function (arr) {
       var survey = arr[0];
       if (!survey) return null;
+
+      // 匿名收集：提交不在 responses 表（服务端 deny all，只经 RPC 聚合）。
+      // 此处不读 responses，也不做未交名单，避免用 total - submitted 反推谁没交。
+      if (survey.anonymous) {
+        return {
+          survey: survey,
+          anonymous: true,
+          total: 0,
+          submitted: 0,
+          missing: [],
+          missingIds: [],
+          questions: (survey.questions || []).map(function (q) {
+            return {
+              qid: q.qid, type: q.type, title: q.title, options: q.options || [],
+              counts: {}, texts: [], votes: 0, breakdown: [], answered: 0
+            };
+          })
+        };
+      }
+
       var all = arr[1] || [];
       var members = arr[2] || [];
       var responses = all.filter(function (r) { return r.surveyId === surveyId; });
@@ -231,18 +276,10 @@ window.CA = window.CA || {};
           var vals = Array.isArray(a.value) ? a.value : [a.value];
           vals.forEach(function (v) { if (v != null && v !== "") counts[v] = (counts[v] || 0) + 1; });
         });
-        var votes = 0;
-        Object.keys(counts).forEach(function (k) { votes += counts[k]; });
-        // 选项拆分：优先使用问卷定义顺序，补上定义外的自由选项
-        var labels = (q.options || []).slice();
-        Object.keys(counts).forEach(function (k) { if (labels.indexOf(k) < 0) labels.push(k); });
-        var breakdown = labels.map(function (label) {
-          var c = counts[label] || 0;
-          return { label: label, count: c, percent: votes ? round1(c / votes * 100) : 0 };
-        });
+        var bd = breakdownOf(counts, q.options);
         return {
           qid: q.qid, type: q.type, title: q.title, options: q.options || [],
-          counts: counts, texts: texts, votes: votes, breakdown: breakdown, answered: responses.length
+          counts: counts, texts: texts, votes: bd.votes, breakdown: bd.breakdown, answered: responses.length
         };
       });
 
@@ -462,6 +499,86 @@ window.CA = window.CA || {};
 
   function errMsg(e) { return (e && e.message) || "操作失败"; }
 
+  // ---------- 匿名收集：本机凭据 + RPC ----------
+  // 凭据只存本机（内存 + localStorage），绝不写入任何云表；服务端只存加盐 md5(token)。
+  var anonTokenCache = {};   // 内存缓存：localStorage 被禁用时，本次会话内仍保持同一 token
+
+  function anonTokenKey(surveyId) { return "ca_anon_" + surveyId; }
+
+  // 纯函数：生成 32+ 位十六进制随机 token（crypto 优先，Math.random 降级），便于单测
+  function genAnonToken() {
+    var hex = "0123456789abcdef";
+    var out = "";
+    var i;
+    try {
+      if (typeof crypto !== "undefined" && crypto && typeof crypto.getRandomValues === "function") {
+        var buf = new Uint8Array(32);
+        crypto.getRandomValues(buf);
+        for (i = 0; i < buf.length; i++) out += hex.charAt(buf[i] & 15) + hex.charAt(buf[i] >> 4);
+        return out;   // 64 位十六进制
+      }
+    } catch (e) { /* 降级到 Math.random */ }
+    for (i = 0; i < 32; i++) out += hex.charAt(Math.floor(Math.random() * 16));
+    return out;   // 32 位十六进制
+  }
+
+  // 取（或首次生成并落地）本机匿名 token
+  function anonToken(surveyId) {
+    var key = anonTokenKey(surveyId);
+    if (anonTokenCache[key]) return anonTokenCache[key];
+    var saved = "";
+    try {
+      if (typeof localStorage !== "undefined" && localStorage && localStorage.getItem) {
+        saved = String(localStorage.getItem(key) || "");
+      }
+    } catch (e) { saved = ""; }
+    if (!saved || saved.length < 8) {
+      saved = genAnonToken();
+      try {
+        if (typeof localStorage !== "undefined" && localStorage && localStorage.setItem) {
+          localStorage.setItem(key, saved);
+        }
+      } catch (e) { /* 隐私模式下可能被禁：仅保留内存缓存 */ }
+    }
+    anonTokenCache[key] = saved;
+    return saved;
+  }
+
+  var ANON_ERRORS = {
+    NOT_AUTHENTICATED: "登录已失效，请重新登录后再试",
+    BAD_INPUT: "提交内容不合法",
+    SURVEY_NOT_FOUND: "收集表不存在或已删除",
+    CLOSED: "该收集已关闭，无法提交",
+    EXPIRED: "已过截止时间，无法提交"
+  };
+
+  function anonError(code) {
+    return new Error(ANON_ERRORS[code] || "操作失败，请稍后重试");
+  }
+
+  // 统一 RPC 调用：返回函数 json 结果；传输错误（{ error }）则 reject
+  function rpcCall(fn, params) {
+    var app = CA.cloud && CA.cloud.app;
+    if (!app || typeof app.rdb !== "function") return Promise.reject(new Error("云端未就绪，无法提交"));
+    var db = null;
+    try { db = app.rdb(); } catch (e) { db = null; }
+    if (!db || typeof db.rpc !== "function") return Promise.reject(new Error("云端未就绪，无法提交"));
+    return Promise.resolve(db.rpc(fn, params)).then(function (res) {
+      if (res && typeof res === "object" && res.error) {
+        throw new Error((res.error && (res.error.message || res.error.msg)) || "云端调用失败");
+      }
+      return (res && typeof res === "object" && has(res, "data")) ? res.data : res;
+    });
+  }
+
+  // RPC + 业务码（{ ok:false, code } 统一转中文 Error）
+  function anonCall(fn, params) {
+    return rpcCall(fn, params).then(function (res) {
+      if (res && res.ok === false) throw anonError(res.code);
+      return res;
+    });
+  }
+
   // ============================================================
   // 数据加载（异步，写缓存）
   // ============================================================
@@ -562,8 +679,13 @@ window.CA = window.CA || {};
 
     var side = h("div", { class: "row" });
     if (state.isAdmin) {
-      // 管理端：已交进度（.admin-only 供 CSS 兜底隐藏）
-      side.appendChild(h("span", { class: "chip admin-only", text: "已交 " + submitted + "/" + total }));
+      // 管理端：已交进度（.admin-only 供 CSS 兜底隐藏）；
+      // 匿名收集不显示「已交 X/Y」——否则可用 total - submitted 反推谁没交。
+      if (!s.anonymous) {
+        side.appendChild(h("span", { class: "chip admin-only", text: "已交 " + submitted + "/" + total }));
+      }
+    } else if (s.anonymous) {
+      // 匿名：真实状态需经 RPC 查询，列表不做同步判断（进入详情查看）
     } else {
       var mine = mid ? findResponse(s.id, mid) : null;
       if (mine) side.appendChild(h("span", { class: "badge badge-success student-only", text: "已提交" }));
@@ -606,14 +728,76 @@ window.CA = window.CA || {};
     if (!state || !state.selectedId) { clearDetail(); return Promise.resolve(); }
     var s = findSurvey(state.selectedId);
     if (!s) { clearDetail(); return Promise.resolve(); }
-    if (state.isAdmin) return renderResult(s);
+    if (state.isAdmin) return s.anonymous ? renderResultAnon(s) : renderResult(s);
     renderFill(s);
     return Promise.resolve();
   }
 
   // ============================================================
-  // 管理员 · 结果
+  // 管理员 · 结果（共用：卡片头 + 管理动作 / 逐题区块）
   // ============================================================
+  function manageActions(s) {
+    var actions = h("div", { class: "row manage-actions admin-only" });
+    var editBtn = h("button", { class: "btn btn-quiet btn-labeled btn-sm", type: "button", "data-act": "edit" }, [iconEl("edit", 14), h("span", { text: "编辑" })]);
+    editBtn.addEventListener("click", function () { openForm(s); });
+    actions.appendChild(editBtn);
+
+    var toggleBtn = h("button", { class: "btn btn-quiet btn-sm", type: "button", "data-act": "toggle" });
+    toggleBtn.appendChild(iconEl(s.status === "closed" ? "check" : "clock", 14));
+    toggleBtn.appendChild(h("span", { text: s.status === "closed" ? "重新开启" : "关闭收集" }));
+    toggleBtn.addEventListener("click", function () { onToggleStatus(s, toggleBtn); });
+    actions.appendChild(toggleBtn);
+
+    var delBtn = h("button", { class: "btn btn-danger btn-sm", type: "button", "data-act": "delete" }, [iconEl("trash", 14), h("span", { text: "删除" })]);
+    delBtn.addEventListener("click", function () { onDelete(s, delBtn); });
+    actions.appendChild(delBtn);
+    return actions;
+  }
+
+  function resultCardHead(s, st) {
+    var card = h("div", { class: "card card-sticker admin-only" });
+    var head = h("div", { class: "card-head" });
+    var headTitle = h("div", { class: "card-title" }, [
+      iconEl("clipboard", 18),
+      h("span", { text: s.title }),
+      h("span", { class: "badge " + st.cls, text: st.label })
+    ]);
+    if (s.anonymous) headTitle.appendChild(h("span", { class: "badge badge-muted", text: "匿名收集" }));
+    headTitle.appendChild(h("span", { class: "ca-sticker", text: ((s.questions || []).length) + " 题" }));
+    head.appendChild(headTitle);
+    head.appendChild(manageActions(s));
+    card.appendChild(head);
+    if (s.desc) card.appendChild(h("p", { class: "muted", text: s.desc }));
+    return card;
+  }
+
+  // 单题区块：选项票数条 / 文本回答列表（非匿名与匿名聚合共用）
+  function questionBlock(q, qi) {
+    var block = h("div", { class: "q-block" });
+    block.appendChild(h("div", { class: "q-head" }, [
+      h("div", { class: "q-title", text: (qi + 1) + ". " + q.title }),
+      h("span", { class: "badge badge-cat", text: typeLabel(q.type) })
+    ]));
+    if (q.type === "text") {
+      if (q.texts && q.texts.length) {
+        var list = h("div", { class: "text-list" });
+        q.texts.forEach(function (t) { list.appendChild(h("div", { class: "text-item", text: t })); });
+        block.appendChild(list);
+      } else {
+        block.appendChild(h("div", { class: "muted", text: "暂无文本回答" }));
+      }
+    } else {
+      (q.breakdown || []).forEach(function (b) {
+        block.appendChild(h("div", { class: "opt-row" }, [
+          h("span", { class: "opt-name", text: b.label }),
+          h("div", { class: "bar" }, [h("i", { style: "width:" + b.percent + "%" })]),
+          h("span", { class: "opt-count", text: b.count + " 票（" + b.percent + "%）" })
+        ]));
+      });
+    }
+    return block;
+  }
+
   function renderResult(s) {
     var det = state.detailEl;
     det.hidden = false;
@@ -626,36 +810,7 @@ window.CA = window.CA || {};
       if (!state || token !== mountToken || state.selectedId !== s.id) return;
       det.innerHTML = "";
 
-      var card = h("div", { class: "card card-sticker admin-only" });
-      var head = h("div", { class: "card-head" });
-      var headTitle = h("div", { class: "card-title" }, [
-        iconEl("clipboard", 18),
-        h("span", { text: s.title }),
-        h("span", { class: "badge " + st.cls, text: st.label })
-      ]);
-      if (s.anonymous) headTitle.appendChild(h("span", { class: "badge badge-muted", text: "匿名收集" }));
-      headTitle.appendChild(h("span", { class: "ca-sticker", text: ((s.questions || []).length) + " 题" }));
-      head.appendChild(headTitle);
-
-      var actions = h("div", { class: "row manage-actions admin-only" });
-      var editBtn = h("button", { class: "btn btn-quiet btn-labeled btn-sm", type: "button", "data-act": "edit" }, [iconEl("edit", 14), h("span", { text: "编辑" })]);
-      editBtn.addEventListener("click", function () { openForm(s); });
-      actions.appendChild(editBtn);
-
-      var toggleBtn = h("button", { class: "btn btn-quiet btn-sm", type: "button", "data-act": "toggle" });
-      toggleBtn.appendChild(iconEl(s.status === "closed" ? "check" : "clock", 14));
-      toggleBtn.appendChild(h("span", { text: s.status === "closed" ? "重新开启" : "关闭收集" }));
-      toggleBtn.addEventListener("click", function () { onToggleStatus(s, toggleBtn); });
-      actions.appendChild(toggleBtn);
-
-      var delBtn = h("button", { class: "btn btn-danger btn-sm", type: "button", "data-act": "delete" }, [iconEl("trash", 14), h("span", { text: "删除" })]);
-      delBtn.addEventListener("click", function () { onDelete(s, delBtn); });
-      actions.appendChild(delBtn);
-
-      head.appendChild(actions);
-      card.appendChild(head);
-
-      if (s.desc) card.appendChild(h("p", { class: "muted", text: s.desc }));
+      var card = resultCardHead(s, st);
 
       // 统计概览 v4：墨色海报块（.card-ink）+ 大号 KPI（见 DESIGN.md §13.3）
       var total = data ? data.total : ((state.members || []).length);
@@ -669,31 +824,7 @@ window.CA = window.CA || {};
       ]));
 
       // 逐题统计
-      (data ? data.questions : []).forEach(function (q, qi) {
-        var block = h("div", { class: "q-block" });
-        block.appendChild(h("div", { class: "q-head" }, [
-          h("div", { class: "q-title", text: (qi + 1) + ". " + q.title }),
-          h("span", { class: "badge badge-cat", text: typeLabel(q.type) })
-        ]));
-        if (q.type === "text") {
-          if (q.texts && q.texts.length) {
-            var list = h("div", { class: "text-list" });
-            q.texts.forEach(function (t) { list.appendChild(h("div", { class: "text-item", text: t })); });
-            block.appendChild(list);
-          } else {
-            block.appendChild(h("div", { class: "muted", text: "暂无文本回答" }));
-          }
-        } else {
-          (q.breakdown || []).forEach(function (b) {
-            block.appendChild(h("div", { class: "opt-row" }, [
-              h("span", { class: "opt-name", text: b.label }),
-              h("div", { class: "bar" }, [h("i", { style: "width:" + b.percent + "%" })]),
-              h("span", { class: "opt-count", text: b.count + " 票（" + b.percent + "%）" })
-            ]));
-          });
-        }
-        card.appendChild(block);
-      });
+      (data ? data.questions : []).forEach(function (q, qi) { card.appendChild(questionBlock(q, qi)); });
 
       det.appendChild(card);
 
@@ -717,6 +848,45 @@ window.CA = window.CA || {};
       if (!state || token !== mountToken || state.selectedId !== s.id) return;
       det.innerHTML = "";
       det.appendChild(emptyState("统计加载失败", errMsg(err) || "无法加载统计结果，请稍后重试。"));
+      toastError(err, "加载统计失败");
+    });
+  }
+
+  // 管理端 · 匿名聚合（RPC anon_summary）：只展示票数/文本，绝不渲染未交名单或身份
+  function renderResultAnon(s) {
+    var det = state.detailEl;
+    det.hidden = false;
+    det.innerHTML = "";
+    var st = surveyState(s);
+    var token = mountToken;
+
+    return anonCall("anon_summary", { p_survey_id: s.id }).then(function (data) {
+      if (!state || token !== mountToken || state.selectedId !== s.id) return;
+      det.innerHTML = "";
+
+      var card = resultCardHead(s, st);
+      card.appendChild(h("p", { class: "muted", text: "匿名收集：以下仅为聚合结果，不关联任何成员。" }));
+      card.appendChild(h("div", { class: "card-ink collect-kpi" }, [
+        h("div", { class: "stat-grid" }, [
+          kpiItem(String((data && data.submitted) || 0), "已提交"),
+          kpiItem(fmtSmart(s.deadline), "截止时间")
+        ])
+      ]));
+
+      ((data && data.questions) || []).forEach(function (q, qi) {
+        var bd = breakdownOf(q.counts, q.options);
+        card.appendChild(questionBlock({
+          qid: q.qid, type: q.type, title: q.title, options: q.options || [],
+          texts: q.texts || [], counts: q.counts || {}, votes: bd.votes, breakdown: bd.breakdown, answered: 0
+        }, qi));
+      });
+
+      det.appendChild(card);
+      det.appendChild(renderAiCard(s));
+    }).catch(function (err) {
+      if (!state || token !== mountToken || state.selectedId !== s.id) return;
+      det.innerHTML = "";
+      det.appendChild(emptyState("统计加载失败", errMsg(err) || "无法加载匿名聚合结果，请稍后重试。"));
       toastError(err, "加载统计失败");
     });
   }
@@ -809,6 +979,7 @@ window.CA = window.CA || {};
   // 学生 · 填写 / 已提交
   // ============================================================
   function renderFill(s) {
+    if (s.anonymous) { renderFillAnon(s); return; }
     var det = state.detailEl;
     det.hidden = false;
     det.innerHTML = "";
@@ -857,8 +1028,73 @@ window.CA = window.CA || {};
     det.appendChild(card);
   }
 
-  function renderSubmitted(card, s, existing) {
-    card.appendChild(h("p", { class: "muted", text: "你已于以下时间提交，以下为你的回答：" }));
+  // 学生端 · 匿名：状态 / 回显 / 修改全部经 my_anonymous（凭据仅存本机，不落云表）
+  function renderFillAnon(s) {
+    var det = state.detailEl;
+    det.hidden = false;
+    det.innerHTML = "";
+    var token = mountToken;
+    det.appendChild(h("div", { class: "card card-sticker student-only" }, [
+      h("p", { class: "muted", text: "加载中…" })
+    ]));
+
+    return anonCall("my_anonymous", { p_survey_id: s.id, p_token: anonToken(s.id) }).then(function (res) {
+      if (!state || token !== mountToken || state.selectedId !== s.id) return;
+      renderAnonDetail(s, !!(res && res.found), (res && res.answers) || null);
+    }).catch(function (err) {
+      if (!state || token !== mountToken || state.selectedId !== s.id) return;
+      det.innerHTML = "";
+      det.appendChild(emptyState("加载失败", errMsg(err) || "无法读取提交状态，请稍后重试。"));
+      toastError(err, "加载失败");
+    });
+  }
+
+  function renderAnonDetail(s, found, answers) {
+    var det = state.detailEl;
+    det.innerHTML = "";
+    var st = surveyState(s);
+    var existing = found ? { answers: answers || [] } : null;   // memberId 故意缺失：匿名不关联身份
+
+    var card = h("div", { class: "card card-sticker student-only" });
+    var head = h("div", { class: "card-head" });
+    var headTitle = h("div", { class: "card-title" }, [
+      iconEl("clipboard", 18),
+      h("span", { text: s.title }),
+      h("span", { class: "badge " + st.cls, text: st.label }),
+      h("span", { class: "badge badge-muted", text: "匿名" })
+    ]);
+    if (existing) headTitle.appendChild(h("span", { class: "badge badge-success", text: "已提交" }));
+    headTitle.appendChild(h("span", {
+      class: "ca-sticker",
+      text: existing ? "已完成" : (st.fillable ? "去填写" : "已结束")
+    }));
+    head.appendChild(headTitle);
+    card.appendChild(head);
+
+    if (s.desc) card.appendChild(h("p", { class: "muted", text: s.desc }));
+
+    var meta = h("div", { class: "list-meta" });
+    meta.appendChild(iconEl("clock", 13));
+    meta.appendChild(h("span", { text: "截止 " + fmtSmart(s.deadline) }));
+    card.appendChild(meta);
+
+    // 轻微提示（不弹窗）：匿名凭据只在本机，换设备/清缓存会丢
+    card.appendChild(h("p", { class: "toolbar-note", text: "提交凭据仅保存在本机；换设备或清除缓存后无法找回原有提交。" }));
+
+    if (existing && !state.reEditing) {
+      renderSubmitted(card, s, existing, "你已提交，以下为你的回答：");
+    } else if (!st.fillable) {
+      card.appendChild(h("p", { class: "muted", text: st.key === "closed" ? "该收集已关闭，无法提交。" : "已过截止时间，无法提交。" }));
+      if (existing) card.appendChild(h("p", { class: "muted", text: "你已提交过，以下为你的回答：" }));
+      if (existing) renderOwnAnswers(card, s, existing);
+    } else {
+      renderFillForm(card, s, existing);
+    }
+    det.appendChild(card);
+  }
+
+  function renderSubmitted(card, s, existing, note) {
+    card.appendChild(h("p", { class: "muted", text: note || "你已于以下时间提交，以下为你的回答：" }));
     renderOwnAnswers(card, s, existing);
     var actions = h("div", { class: "form-actions" });
     var editBtn = h("button", { class: "btn btn-lime btn-sm", type: "button" }, [iconEl("edit", 14), h("span", { text: "修改提交" })]);
@@ -994,7 +1230,7 @@ window.CA = window.CA || {};
     var answers = {};
     var errors = [];
     (s.questions || []).forEach(function (q) {
-      var ins = form.querySelectorAll('[name="ans_' + q.qid + '"]');
+      var ins = toArray(form.querySelectorAll('[name="ans_' + q.qid + '"]'));
       if (q.type === "text") {
         var ta = ins[0];
         var val = ta ? String(ta.value || "").trim() : "";
@@ -1013,6 +1249,9 @@ window.CA = window.CA || {};
       toast(errors[0], "error");
       return Promise.resolve();
     }
+
+    // 匿名问卷：走 RPC，不需要（也不使用）memberId
+    if (s.anonymous) return submitAnonAnswers(s, answers, submit);
 
     var mid = myMemberId();
     if (!mid) { toast("未在班级名单中找到你的信息", "error"); return Promise.resolve(); }
@@ -1034,6 +1273,25 @@ window.CA = window.CA || {};
         toastError(err, "提交失败");
         setBusy(submit, false, null, existing ? "保存修改" : "提交");
       });
+  }
+
+  // 匿名提交：p_answers 直接传 buildResponse 的 [{qid,value}] 数组
+  function submitAnonAnswers(s, answers, submit) {
+    var editing = !!state.reEditing;
+    var built = buildResponse(s, answers, null);
+    setBusy(submit, true, "提交中…");
+    return anonCall("submit_anonymous", {
+      p_survey_id: s.id,
+      p_token: anonToken(s.id),
+      p_answers: built.answers
+    }).then(function () {
+      toast(editing ? "已更新你的提交" : "提交成功", "success");
+      state.reEditing = false;
+      return refresh();
+    }).catch(function (err) {
+      toastError(err, "提交失败");
+      setBusy(submit, false, null, editing ? "保存修改" : "提交");
+    });
   }
 
   // ============================================================
@@ -1224,12 +1482,12 @@ window.CA = window.CA || {};
     if (dlEl) d.deadline = dlEl.value;
     if (anonEl) d.anonymous = !!anonEl.checked;
 
-    var items = form.querySelectorAll(".q-item");
+    var items = toArray(form.querySelectorAll(".q-item"));
     d.questions = items.map(function (item) {
       var typeEl = item.querySelector('[name="q_type"]');
       var titleIn = item.querySelector('[name="q_title"]');
       var reqEl = item.querySelector('[name="q_required"]');
-      var opts = item.querySelectorAll('[name="q_option"]').map(function (inp) { return inp.value; });
+      var opts = toArray(item.querySelectorAll('[name="q_option"]')).map(function (inp) { return inp.value; });
       return {
         qid: item.getAttribute("data-qid") || "",
         type: typeEl ? typeEl.value : "single",
@@ -1450,6 +1708,8 @@ window.CA = window.CA || {};
     computeStats: computeStats,
     validate: validate,
     buildResponse: buildResponse,
-    renderMarkdown: renderMarkdown
+    renderMarkdown: renderMarkdown,
+    genAnonToken: genAnonToken,
+    anonToken: anonToken
   };
 })();

@@ -260,6 +260,10 @@ CA.app = (function () {
       } else if (view === "messages" && CA.views && CA.views.messages) {
         activeModule = CA.views.messages;
         pending = activeModule.mount(section);
+      } else if (view === "materials" && CA.views && CA.views.materials) {
+        // 班级共享资料库（资料上云；解析与学习记录仍留本机，见 ROADMAP D4）
+        activeModule = CA.views.materials;
+        pending = activeModule.mount(section);
       } else if (view === "collect") {
         renderCollect(section);
       } else if (view === "review") {
@@ -339,10 +343,350 @@ CA.app = (function () {
     ]));
   }
 
+  // ---------- 设置页：注入样式（不改 styles.css，只服务新增的管理控件） ----------
+  function injectSettingsStyles() {
+    if (!document.head || document.getElementById("ca-settings-style")) return;
+    var s = document.createElement("style");
+    s.id = "ca-settings-style";
+    s.textContent = [
+      ".head-actions{margin-left:auto;display:flex;gap:8px;align-items:center}",
+      ".member-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}",
+      ".acct-cell{display:flex;gap:6px;align-items:center;flex-wrap:wrap}",
+      ".settings-alert{margin:0 0 12px;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.6;border:1px solid transparent}",
+      ".settings-alert.warn{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.45);color:#b45309}",
+      ".form-grid{display:grid;gap:10px}",
+      ".form-grid label{display:block;font-size:12px;font-weight:600;margin-bottom:4px}",
+      ".form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}",
+      ".field-hint{font-size:12px;margin-top:6px}"
+    ].join("");
+    document.head.appendChild(s);
+  }
+
+  // ---------- 设置页：账号管理（云函数 admin-user；CAM 密钥只在云函数环境变量） ----------
+  function errText(e) {
+    if (!e) return "未知错误";
+    return e.message || e.msg || e.code || String(e);
+  }
+
+  function callAccountService(data) {
+    var app = CA.cloud && CA.cloud.app;
+    if (!app || typeof app.callFunction !== "function") {
+      return Promise.reject(new Error("CloudBase 不可用：无法调用账号管理云函数"));
+    }
+    return Promise.resolve(app.callFunction({ name: "admin-user", data: data })).then(function (res) {
+      var r = (res && res.result !== undefined) ? res.result : res;
+      if (!r || typeof r !== "object") throw new Error("账号服务无有效返回");
+      return r;
+    });
+  }
+
+  // probe：检查云函数环境变量是否齐全（缺哪个由云函数在 message 中逐个列出）
+  function probeAccountService() {
+    return callAccountService({ action: "probe" }).then(function (r) {
+      return { ready: !!(r && r.ok), message: (r && r.message) || "" };
+    }).catch(function (e) {
+      return { ready: false, message: "账号服务不可用：" + errText(e) };
+    });
+  }
+
+  // 密码规则（与 cloudfunctions/admin-user 顶部注释一致）
+  // 8–32 位、不以特殊字符开头、至少含小写/大写/数字/符号四类中的三类
+  var PWD_RULE_MSG = "密码需 8–32 位且至少含大小写/数字/符号中的三类；纯学号不合规";
+  function passwordRuleError(pwd) {
+    var p = String(pwd == null ? "" : pwd);
+    if (p.length < 8 || p.length > 32) return PWD_RULE_MSG;
+    if (!/^[A-Za-z0-9]/.test(p)) return PWD_RULE_MSG;
+    var classes = 0;
+    if (/[a-z]/.test(p)) classes++;
+    if (/[A-Z]/.test(p)) classes++;
+    if (/[0-9]/.test(p)) classes++;
+    if (/[()!@#$%^&*\\|?><_-]/.test(p)) classes++;
+    if (classes < 3) return PWD_RULE_MSG;
+    return "";
+  }
+
+  // ---------- 设置页：班级成员增删改 ----------
+  var STUDENT_NO_RE = /^[0-9A-Za-z]{4,20}$/;
+
+  function validateMemberInput(name, studentNo) {
+    var n = String(name == null ? "" : name).trim();
+    var no = String(studentNo == null ? "" : studentNo).trim();
+    if (!n) return { ok: false, message: "请填写姓名" };
+    if (n.length > 20) return { ok: false, message: "姓名不能超过 20 个字" };
+    if (!no) return { ok: false, message: "请填写学号" };
+    if (!STUDENT_NO_RE.test(no)) return { ok: false, message: "学号需为 4–20 位字母或数字" };
+    return { ok: true, name: n, studentNo: no };
+  }
+
+  function isDuplicateError(e) {
+    if (!e) return false;
+    if (e.code === "23505") return true;
+    return /duplicate key|unique constraint|already exists|唯一/i.test(e.message || String(e));
+  }
+
+  // users 与 members 的绑定关系：新表用 memberId，兼容旧形态的 studentNo
+  function buildUserIndex(users) {
+    var byMemberId = {};
+    var list = users || [];
+    list.forEach(function (u) { if (u && u.memberId) byMemberId[u.memberId] = u; });
+    return {
+      of: function (m) {
+        if (!m) return null;
+        if (byMemberId[m.id]) return byMemberId[m.id];
+        for (var i = 0; i < list.length; i++) {
+          if (list[i] && list[i].studentNo && String(list[i].studentNo) === String(m.studentNo)) return list[i];
+        }
+        return null;
+      }
+    };
+  }
+
+  function isAdminRole(role) { return role === "admin" || role === "superAdmin"; }
+
+  function openMemberForm(m, members) {
+    var isEdit = !!m;
+    var nameI = el("input", { class: "input", name: "name", type: "text", maxlength: "20", placeholder: "姓名" });
+    var noI = el("input", { class: "input", name: "studentNo", type: "text", maxlength: "20", placeholder: "学号（4–20 位字母或数字）" });
+    nameI.value = isEdit ? (m.name || "") : "";
+    noI.value = isEdit ? (m.studentNo || "") : "";
+    var err = el("p", { class: "field-error" });
+    err.style.display = "none";
+    var form = el("form", { class: "form-grid" }, [
+      el("div", null, [el("label", { text: "姓名" }), nameI]),
+      el("div", null, [el("label", { text: "学号" }), noI, el("div", { class: "field-hint muted", text: "4–20 位字母或数字，需全班唯一" })]),
+      err,
+      el("div", { class: "form-actions" }, [
+        el("button", { class: "btn btn-sm", type: "button", text: "取消", onclick: closeModal }),
+        el("button", { class: "btn btn-sm btn-primary", type: "submit", text: isEdit ? "保存" : "新增" })
+      ])
+    ]);
+    form.addEventListener("submit", function (ev) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      var v = validateMemberInput(nameI.value, noI.value);
+      if (!v.ok) { err.textContent = v.message; err.style.display = ""; return; }
+      var clash = (members || []).some(function (x) {
+        return x && x.id !== (isEdit ? m.id : null) && String(x.studentNo) === v.studentNo;
+      });
+      if (clash) {
+        var clashMsg = "学号 " + v.studentNo + " 已存在（学号必须唯一）";
+        err.textContent = clashMsg; err.style.display = "";
+        toast(clashMsg, "error");
+        return;
+      }
+      var p = isEdit
+        ? CA.store.update("members", m.id, { name: v.name, studentNo: v.studentNo })
+        : CA.store.add("members", { id: CA.store.uid("m"), name: v.name, studentNo: v.studentNo });
+      Promise.resolve(p).then(function () {
+        closeModal();
+        toast(isEdit ? "已更新成员" : "已新增成员", "success");
+        if (_authed) rerender();
+      }).catch(function (e) {
+        err.textContent = isDuplicateError(e)
+          ? ("学号 " + v.studentNo + " 已存在（学号必须唯一）")
+          : ("保存失败：" + errText(e));
+        err.style.display = "";
+      });
+    });
+    openModal(el("div", null, [
+      el("div", { class: "card-title", text: isEdit ? "编辑成员" : "新增成员" }),
+      form
+    ]));
+  }
+
+  // 删除成员：先清可删的关联数据（成绩 / 收集提交），再删 member；任一被 RLS 拒都给出可读错误
+  function onDeleteMember(m, btn) {
+    var okConfirm = true;
+    try {
+      if (typeof window.confirm === "function") {
+        okConfirm = window.confirm("确定删除成员「" + m.name + "」吗？该学生的成绩、收集提交、收藏等关联数据会一并删除，不可恢复。");
+      }
+    } catch (e) { okConfirm = true; }
+    if (!okConfirm) return Promise.resolve();
+
+    if (btn) btn.disabled = true;
+    return CA.store.query("scores", function (r) { return r.memberId === m.id; })
+      .then(function (list) {
+        return Promise.all((list || []).map(function (r) { return CA.store.remove("scores", r.id); }));
+      })
+      .then(function () {
+        return CA.store.query("responses", function (r) { return r.memberId === m.id; });
+      })
+      .then(function (list) {
+        return Promise.all((list || []).map(function (r) { return CA.store.remove("responses", r.id); }));
+      })
+      .then(function () { return CA.store.remove("members", m.id); })
+      .then(function () {
+        toast("已删除成员", "success");
+        if (_authed) rerender();
+      })
+      .catch(function (e) {
+        toast("删除失败：" + errText(e), "error");
+        if (btn) btn.disabled = false;
+      });
+  }
+
+  function openAccountForm(m, u, mode) {
+    var isReset = mode === "resetPassword";
+    var pwdI = el("input", { class: "input", name: "password", type: "password", maxlength: "32", placeholder: "密码" });
+    if (!isReset) pwdI.value = m.studentNo || "";
+    var err = el("p", { class: "field-error" });
+    err.style.display = "none";
+    var noI = el("input", { class: "input", type: "text" });
+    noI.value = m.studentNo || ""; noI.setAttribute("readonly", "readonly");
+    var nameI = el("input", { class: "input", type: "text" });
+    nameI.value = m.name || ""; nameI.setAttribute("readonly", "readonly");
+    var form = el("form", { class: "form-grid" }, [
+      el("div", null, [el("label", { text: "学号" }), noI]),
+      el("div", null, [el("label", { text: "姓名" }), nameI]),
+      el("div", null, [
+        el("label", { text: isReset ? "新密码" : "初始密码" }), pwdI,
+        el("div", { class: "field-hint muted", text: "8–32 位，至少含大小写/数字/符号中的三类；纯学号不合规" })
+      ]),
+      err,
+      el("div", { class: "form-actions" }, [
+        el("button", { class: "btn btn-sm", type: "button", text: "取消", onclick: closeModal }),
+        el("button", { class: "btn btn-sm btn-primary", type: "submit", text: isReset ? "重置密码" : "创建账号" })
+      ])
+    ]);
+    form.addEventListener("submit", function (ev) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      var bad = passwordRuleError(pwdI.value);
+      if (bad) { err.textContent = bad; err.style.display = ""; toast(bad, "error"); return; }
+      var payload = isReset
+        ? { action: "resetPassword", uid: (u && u.uid) || "", password: pwdI.value }
+        : { action: "create", studentNo: m.studentNo, displayName: m.name, password: pwdI.value };
+      callAccountService(payload).then(function (r) {
+        if (r && r.ok) {
+          closeModal();
+          toast(isReset ? "密码已重置" : "账号已创建", "success");
+          if (_authed) rerender();
+          return;
+        }
+        var msg = (r && r.message) || "账号操作失败";
+        err.textContent = msg; err.style.display = "";
+        toast(msg, "error");
+      }).catch(function (e) {
+        var msg = "账号操作失败：" + errText(e);
+        err.textContent = msg; err.style.display = "";
+        toast(msg, "error");
+      });
+    });
+    openModal(el("div", null, [
+      el("div", { class: "card-title", text: isReset ? "重置密码" : "创建账号" }),
+      el("p", { class: "muted", text: isReset
+        ? "为该账号设置新密码（不改变角色与绑定关系）。"
+        : "为名单成员创建登录账号（角色 member，首次登录须改密）。" }),
+      form
+    ]));
+  }
+
+  function buildMembersCard(data, acct) {
+    var members = (data.members || []).slice().sort(function (a, b) {
+      return String(a.studentNo || "").localeCompare(String(b.studentNo || ""));
+    });
+    var idx = buildUserIndex(data.users);
+
+    var card = el("div", { class: "card" }, [
+      el("div", { class: "card-head" }, [
+        el("div", { class: "card-title", text: "班级名单" }),
+        el("div", { class: "card-sub", text: members.length + " 人" }),
+        el("div", { class: "head-actions" }, [
+          el("button", {
+            class: "btn btn-sm btn-primary admin-only", type: "button", text: "新增成员",
+            onclick: function () { openMemberForm(null, members); }
+          })
+        ])
+      ])
+    ]);
+
+    if (acct && !acct.ready && !acct.skipped && acct.message) {
+      card.appendChild(el("div", {
+        class: "settings-alert warn",
+        text: "账号服务未就绪：" + acct.message + "。请为云函数 admin-user 配置环境变量（TC_SECRET_ID / TC_SECRET_KEY / TCB_ENV_ID / TCB_API_KEY）后，再使用创建账号 / 重置密码。"
+      }));
+    }
+
+    var rows = [el("tr", null, [
+      el("th", { text: "姓名" }),
+      el("th", { text: "学号" }),
+      el("th", { text: "账号" }),
+      el("th", { class: "num", text: "操作" })
+    ])];
+    members.forEach(function (m) {
+      var u = idx.of(m);
+      var acctCell = el("td", { class: "acct-cell" });
+      if (u && u.role) {
+        acctCell.appendChild(el("span", {
+          class: "badge " + (isAdminRole(u.role) ? "badge-success" : "badge-muted"),
+          text: roleLabel(u.role)
+        }));
+        var rpBtn = el("button", { class: "btn btn-sm", type: "button", text: "重置密码" });
+        rpBtn.addEventListener("click", function () { openAccountForm(m, u, "resetPassword"); });
+        acctCell.appendChild(rpBtn);
+      } else {
+        acctCell.appendChild(el("span", { class: "badge badge-muted", text: "未建账号" }));
+        var cBtn = el("button", { class: "btn btn-sm", type: "button", text: "创建账号" });
+        if (acct && !acct.ready) cBtn.disabled = true;
+        cBtn.addEventListener("click", function () { openAccountForm(m, null, "create"); });
+        acctCell.appendChild(cBtn);
+      }
+      var editBtn = el("button", { class: "btn btn-sm", type: "button", text: "编辑", onclick: function () { openMemberForm(m, members); } });
+      var delBtn = el("button", { class: "btn btn-sm btn-danger", type: "button", text: "删除" });
+      delBtn.addEventListener("click", function () { onDeleteMember(m, delBtn); });
+      rows.push(el("tr", null, [
+        el("td", { text: m.name }),
+        el("td", { class: "num", text: m.studentNo }),
+        acctCell,
+        el("td", null, [el("div", { class: "member-actions" }, [editBtn, delBtn])])
+      ]));
+    });
+    card.appendChild(el("div", { class: "table-wrap" }, [el("table", { class: "table table-compact" }, rows)]));
+    return card;
+  }
+
+  // ---------- 设置页：数据管理（真实导出 / 真实重置） ----------
+  var EXPORT_COLLS = ["members", "users", "notices", "favorites", "subjects", "exams", "scores", "surveys", "responses", "messages", "materials"];
+  // 重置保留 members 与 users（账号/名单不可误删）
+  var RESET_COLLS = ["notices", "favorites", "subjects", "exams", "scores", "surveys", "responses", "messages", "materials"];
+
+  function fmtDateStr() {
+    try { if (CA.util && CA.util.fmtDate) return CA.util.fmtDate(new Date()); } catch (e) { /* 忽略 */ }
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function downloadText(filename, text) {
+    var blob = new Blob([text], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    if (a.parentNode) a.parentNode.removeChild(a);
+    setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) { /* 忽略 */ } }, 1000);
+  }
+
+  function buildDataCard(isAdmin) {
+    var btns = [
+      el("button", { class: "btn btn-sm", type: "button", text: "导出数据 JSON", onclick: onExport })
+    ];
+    if (isAdmin) {
+      btns.push(el("button", { class: "btn btn-sm btn-danger admin-only", type: "button", text: "重置数据", onclick: onReset }));
+    }
+    return el("div", { class: "card" }, [
+      el("div", { class: "card-head" }, [el("div", { class: "card-title", text: "数据管理" })]),
+      el("p", { class: "muted", text: isAdmin
+        ? "导出为云端真实数据快照（含所有集合）；重置会删除通知、成绩、收集、留言等业务数据，但保留班级名单与账号。"
+        : "导出为云端真实数据快照（含当前账号有权限读取的集合）。" }),
+      el("div", { class: "btn-group" }, btns)
+    ]);
+  }
+
   // ---------- 设置视图 ----------
   // 异步：CA.auth.current() / CA.store.get() 返回 Promise。内部先渲染 loading 骨架避免白屏，
   // 数据就绪后再填充；失败时抛可读错误，由 switchView 的异步兜底渲染错误占位。
   function renderSettings(root) {
+    injectSettingsStyles();   // 新增管理控件样式（页面内注入，不改 styles.css）
     // 1) 立即渲染 loading 骨架（点击「设置」后不白屏）
     root.appendChild(el("div", { class: "card" }, [
       el("div", { class: "card-head" }, [el("div", { class: "card-title", text: "设置" })]),
@@ -376,18 +720,29 @@ CA.app = (function () {
         try { aiCfgReady = !!(CA.llm && CA.llm.ready && CA.llm.ready()); } catch (e) { aiCfgReady = false; }
         var aiModel = (CA.ai && CA.ai.info) ? (CA.ai.info().model || "") : "";   // 同步
 
+        // 账号服务状态：仅管理员探测云函数环境变量（缺变量时给出可读提示并禁用建号）
+        var pAcct = data.isAdmin
+          ? probeAccountService()
+          : Promise.resolve({ ready: false, message: "", skipped: true });
+        return pAcct.then(function (acct) {
+          return { me: me, isAdmin: data.isAdmin, members: data.members, users: data.users,
+                   aiEnabled: aiEnabled, aiCfgReady: aiCfgReady, aiModel: aiModel, acct: acct };
+        });
+      })
+      .then(function (ctx) {
+        var data = ctx;
         var wrap = el("div", { class: "stack" });
 
         // 1) 当前身份
         wrap.appendChild(el("div", { class: "card" }, [
           el("div", { class: "card-head" }, [el("div", { class: "card-title", text: "当前身份" })]),
           el("div", { class: "row" }, [
-            el("div", { class: "avatar", text: String(me.name || "?").slice(0, 1) }),
+            el("div", { class: "avatar", text: String(data.me.name || "?").slice(0, 1) }),
             el("div", { class: "list-main" }, [
-              el("div", { class: "list-title", text: (me.name || "未知用户") + " · " + roleLabel(me.role) }),
-              el("div", { class: "list-meta", text: me.title || (me.studentNo ? "学号 " + me.studentNo : "") })
+              el("div", { class: "list-title", text: (data.me.name || "未知用户") + " · " + roleLabel(data.me.role) }),
+              el("div", { class: "list-meta", text: data.me.title || (data.me.studentNo ? "学号 " + data.me.studentNo : "") })
             ]),
-            el("span", { class: "badge", text: roleLabel(me.role) })
+            el("span", { class: "badge", text: roleLabel(data.me.role) })
           ]),
           el("p", { class: "muted", text: data.isAdmin
             ? "当前为管理端视角（DESIGN.md §10）：可发布通知、录入成绩、管理班级名单；界面按管理台密度呈现。切换为学生账号可查看学生端界面。"
@@ -398,12 +753,12 @@ CA.app = (function () {
         wrap.appendChild(el("div", { class: "card" }, [
           el("div", { class: "card-head" }, [
             el("div", { class: "card-title", text: "AI 助手" }),
-            el("span", { class: "badge " + (aiEnabled ? "badge-ai" : "badge-muted"), text: aiEnabled ? "已开启" : "已关闭" })
+            el("span", { class: "badge " + (data.aiEnabled ? "badge-ai" : "badge-muted"), text: data.aiEnabled ? "已开启" : "已关闭" })
           ]),
           el("div", { class: "stat-grid" }, [
-            el("div", { class: "stat" }, [el("div", { class: "stat-value", text: aiModel || "未配置" }), el("div", { class: "stat-label", text: "当前模型" })]),
-            el("div", { class: "stat " + (aiCfgReady ? "success" : "warn") }, [el("div", { class: "stat-value", text: aiCfgReady ? "就绪" : "未就绪" }), el("div", { class: "stat-label", text: "通道状态" })]),
-            el("div", { class: "stat" }, [el("div", { class: "stat-value", text: aiEnabled ? "可用" : "已停用" }), el("div", { class: "stat-label", text: "当前开关" })])
+            el("div", { class: "stat" }, [el("div", { class: "stat-value", text: data.aiModel || "未配置" }), el("div", { class: "stat-label", text: "当前模型" })]),
+            el("div", { class: "stat " + (data.aiCfgReady ? "success" : "warn") }, [el("div", { class: "stat-value", text: data.aiCfgReady ? "就绪" : "未就绪" }), el("div", { class: "stat-label", text: "通道状态" })]),
+            el("div", { class: "stat" }, [el("div", { class: "stat-value", text: data.aiEnabled ? "可用" : "已停用" }), el("div", { class: "stat-label", text: "当前开关" })])
           ]),
           el("p", { class: "muted", text: data.isAdmin
             ? "AI 为可选增强：接入走 OpenAI 兼容通道（前端零密钥的代理模式）。关闭后，通知发布、成绩录入与分析图表等基础功能完全不受影响。开关位于右上角。"
@@ -413,44 +768,13 @@ CA.app = (function () {
           ])
         ]));
 
-        // 3) 班级名单（仅管理员）
-        if (data.isAdmin) {
-          var members = (data.members || []).slice().sort(function (a, b) { return String(a.studentNo).localeCompare(String(b.studentNo)); });
-          var rows = [el("tr", null, [el("th", { text: "姓名" }), el("th", { text: "学号" }), el("th", { text: "身份绑定" })])];
-          // users 与 members 的绑定关系：新表用 memberId，兼容旧形态的 studentNo
-          var userByNo = {};
-          var userByMemberId = {};
-          (data.users || []).forEach(function (u) {
-            if (u.studentNo) userByNo[u.studentNo] = u;
-            if (u.memberId) userByMemberId[u.memberId] = u;
-          });
-          members.forEach(function (m) {
-            var u = userByNo[m.studentNo] || userByMemberId[m.id] || null;
-            rows.push(el("tr", null, [
-              el("td", { text: m.name }),
-              el("td", { class: "num", text: m.studentNo }),
-              el("td", {}, [el("span", { class: "badge " + (u ? "badge-success" : "badge-muted"), text: u ? roleLabel(u.role) : "未绑定" })])
-            ]));
-          });
-          wrap.appendChild(el("div", { class: "card" }, [
-            el("div", { class: "card-head" }, [
-              el("div", { class: "card-title", text: "班级名单" }),
-              el("div", { class: "card-sub", text: members.length + " 人" })
-            ]),
-            el("div", { class: "table-wrap" }, [el("table", { class: "table table-compact" }, rows)])
-          ]));
-        }
+        // 3) 班级名单 + 账号管理（仅管理员）
+        if (data.isAdmin) wrap.appendChild(buildMembersCard(data, data.acct));
 
-        // 4) 数据管理（导出 / 重置）
-        wrap.appendChild(el("div", { class: "card" }, [
-          el("div", { class: "card-head" }, [el("div", { class: "card-title", text: "数据管理" })]),
-          el("div", { class: "btn-group" }, [
-            el("button", { class: "btn btn-sm", text: "导出数据 JSON", onclick: onExport }),
-            el("button", { class: "btn btn-sm btn-danger", text: "重置数据", onclick: onReset })
-          ])
-        ]));
+        // 4) 数据管理（导出 / 重置；重置仅管理员）
+        wrap.appendChild(buildDataCard(data.isAdmin));
 
-        // 2) 数据就绪：替换 loading 骨架
+        // 数据就绪：替换 loading 骨架
         root.innerHTML = "";
         root.appendChild(wrap);
       });
@@ -466,32 +790,69 @@ CA.app = (function () {
     });
   }
 
-  function onExport() {
-    try {
-      var raw = window.localStorage.getItem("ca_db") || "{}";
-      var blob = new Blob([raw], { type: "application/json" });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url;
-      a.download = "class-assistant-data-" + (CA.util ? CA.util.fmtDate(new Date()) : Date.now()) + ".json";
-      document.body.appendChild(a);
-      a.click();
-      a.parentNode.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-      toast("已导出数据 JSON", "success");
-    } catch (e) { toast("导出失败：" + ((e && e.message) || e), "error"); }
+  // 真实导出：逐个集合从云端拉取（不读 localStorage.ca_db —— PG 化后该键不存在）
+  // 单个集合读取失败（无权限/未上线）时记为空数组，并在 errors 字段标注原因。
+  function safeGetCollection(coll) {
+    return CA.store.get(coll).then(function (rows) {
+      return { coll: coll, ok: true, rows: rows || [] };
+    }).catch(function (e) {
+      return { coll: coll, ok: false, rows: [], error: errText(e) };
+    });
   }
 
-  function onReset() {
-    if (!window.confirm("确定重置数据吗？当前所有修改（通知、成绩等）都会被清除。")) return;
-    var p;
-    try { p = CA.store.reset(); } catch (e) { p = Promise.reject(e); }
-    Promise.resolve(p)
-      .catch(function (e) { toast("重置失败：" + ((e && e.message) || e), "error"); })
-      .then(function () {
-        toast("数据已重置", "success");
-        if (_authed) rerender();
+  function onExport() {
+    var envId = (window.CA_CONFIG && CA_CONFIG.envId) || "";
+    Promise.all(EXPORT_COLLS.map(safeGetCollection)).then(function (list) {
+      var dataObj = {};
+      var errors = {};
+      list.forEach(function (r) {
+        dataObj[r.coll] = r.rows;
+        if (!r.ok) errors[r.coll] = r.error;
       });
+      var payload = { exportedAt: new Date().toISOString(), env: envId, data: dataObj };
+      if (Object.keys(errors).length) payload.errors = errors;
+      downloadText("class-assistant-data-" + fmtDateStr() + ".json", JSON.stringify(payload, null, 2));
+      toast("已导出数据 JSON（" + list.length + " 个集合）", "success");
+    }).catch(function (e) {
+      toast("导出失败：" + errText(e), "error");
+    });
+  }
+
+  // 真实重置：仅管理员；两级确认（confirm + 输入「重置」）
+  // 逐集合串行删除，避免并发打爆；members / users 保留。失败的集合汇总报告。
+  function onReset() {
+    if (!(CA.auth && CA.auth.isAdmin && CA.auth.isAdmin())) { toast("仅管理员可重置数据", "error"); return; }
+    if (!window.confirm("确定重置数据吗？将删除通知、成绩、收集、留言等业务数据（保留班级名单与账号），不可恢复。")) return;
+    var word = "";
+    try { word = window.prompt("请输入「重置」二字以确认执行：", ""); } catch (e) { word = null; }
+    if (word !== "重置") { toast("已取消：未输入「重置」", "info"); return; }
+
+    var results = [];
+    var seq = Promise.resolve();
+    RESET_COLLS.forEach(function (coll) {
+      seq = seq.then(function () {
+        return CA.store.query(coll, function () { return true; })
+          .then(function (list) {
+            return Promise.all((list || []).map(function (row) { return CA.store.remove(coll, row.id); }));
+          })
+          .then(function () { results.push({ coll: coll, status: "ok" }); })
+          .catch(function (e) {
+            // 表未创建（如 materials）不算失败，按跳过处理
+            if (/未支持的数据集合/.test(errText(e))) results.push({ coll: coll, status: "skip" });
+            else results.push({ coll: coll, status: "fail", error: errText(e) });
+          });
+      });
+    });
+    seq.then(function () {
+      var okN = results.filter(function (r) { return r.status === "ok"; }).length;
+      var fails = results.filter(function (r) { return r.status === "fail"; });
+      var skips = results.filter(function (r) { return r.status === "skip"; });
+      var msg = "已清空 " + okN + " 个集合";
+      if (skips.length) msg += "，跳过 " + skips.length + " 个（表不存在）";
+      if (fails.length) msg += "；失败 " + fails.length + " 个：" + fails.map(function (f) { return f.coll; }).join("、");
+      toast(msg, fails.length ? "warn" : "success");
+      if (_authed) rerender();
+    });
   }
 
   // ---------- 启动 ----------

@@ -11,6 +11,7 @@
 //   P1a：members / users / notices / favorites / subscribers
 //   P1b：subjects / exams / scores / surveys / responses（→ survey_responses）
 //   留言：messages（→ messages）
+//   WS-C：materials（→ class_materials，班级共享资料库）
 // 嵌套字段：surveys.questions、responses.answers 以 jsonb 原样透传（无 mapping）。
 window.CA = window.CA || {};
 
@@ -30,7 +31,9 @@ CA.store = (function () {
     surveys:     { table: "surveys",         prefix: "sv", idCol: "id"  },
     responses:   { table: "survey_responses", prefix: "rs", idCol: "id"  },
     // ---- 留言（迁移 20260914210000_add_messages.sql）----
-    messages:    { table: "messages",         prefix: "msg", idCol: "id"  }
+    messages:    { table: "messages",         prefix: "msg", idCol: "id"  },
+    // ---- WS-C：班级共享资料库（迁移 20260915010200_class_materials.sql）----
+    materials:   { table: "class_materials",  prefix: "mt",  idCol: "id"  }
   };
 
   // 驼峰 → 下划线（列名以迁移文件为准）；未列出的字段原样透传
@@ -47,7 +50,8 @@ CA.store = (function () {
     scores:      { examId: "exam_id", subjectId: "subject_id", memberId: "member_id" },
     surveys:     { desc: "description", createdBy: "created_by", createdAt: "created_at", updatedAt: "updated_at" },
     responses:   { surveyId: "survey_id", memberId: "member_id", createdAt: "created_at" },
-    messages:    { fromUid: "from_uid", fromMemberId: "from_member_id", createdAt: "created_at", readAt: "read_at", replyContent: "reply_content", replyAt: "reply_at" }
+    messages:    { fromUid: "from_uid", fromMemberId: "from_member_id", createdAt: "created_at", readAt: "read_at", replyContent: "reply_content", replyAt: "reply_at" },
+    materials:   { fileName: "file_name", filePath: "file_path", fileSize: "file_size", fileType: "file_type", uploaderUid: "uploader_uid", createdAt: "created_at", updatedAt: "updated_at" }
   };
 
   // 反向映射：下划线 → 驼峰（模块加载时构建一次）

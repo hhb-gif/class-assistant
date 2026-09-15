@@ -17,6 +17,20 @@ function camel(name) {
   return name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
+// 类 NodeList：只有 length / 数字索引 / item() / forEach，故意不提供 map/filter/slice，
+// 用来暴露「在 querySelectorAll 结果上直接调数组方法」这类真实浏览器才会炸的 bug。
+class StubNodeList {
+  constructor(items) {
+    const list = items || [];
+    this.length = list.length;
+    for (let i = 0; i < list.length; i++) this[i] = list[i];
+  }
+  item(i) { return this[i] != null ? this[i] : null; }
+  forEach(cb, thisArg) {
+    for (let i = 0; i < this.length; i++) cb.call(thisArg, this[i], i, this);
+  }
+}
+
 class StubEl {
   constructor(tag) {
     this.tagName = String(tag).toUpperCase();
@@ -88,7 +102,7 @@ class StubEl {
     while (node) { if (matchesSimple(node, sel)) return node; node = node.parentNode; }
     return null;
   }
-  querySelectorAll(sel) { return queryAll(this, sel); }
+  querySelectorAll(sel) { return new StubNodeList(queryAll(this, sel)); }
   querySelector(sel) { return queryAll(this, sel)[0] || null; }
   contains(other) {
     let n = other;
@@ -181,7 +195,7 @@ const documentStub = {
     return null;
   },
   querySelector(sel) { return queryAll(docRoot, sel)[0] || null; },
-  querySelectorAll(sel) { return queryAll(docRoot, sel); },
+  querySelectorAll(sel) { return new StubNodeList(queryAll(docRoot, sel)); },
   addEventListener() {},
   removeEventListener() {},
 };
@@ -296,6 +310,54 @@ CA.icon = (name, size) => {
 };
 CA.util = { fmtSmart: (v) => (v ? "SMART(" + String(v) + ")" : "—") };
 
+// 云端 RPC 桩：可控（记录调用参数、内存匿名提交、可强制失败）
+let rpcCalls = [];
+let rpcFail = null;
+const anonStore = {};   // surveyId -> { token -> answers }
+CA.cloud = {
+  app: {
+    rdb() {
+      return {
+        rpc(fn, params) {
+          rpcCalls.push({ fn, params: clone(params) });
+          if (rpcFail) return Promise.reject(new Error("rpc 网络中断"));
+          if (fn === "submit_anonymous") {
+            const k = params.p_survey_id;
+            anonStore[k] = anonStore[k] || {};
+            anonStore[k][params.p_token] = clone(params.p_answers);
+            return Promise.resolve({ data: { ok: true }, error: null });
+          }
+          if (fn === "my_anonymous") {
+            const rec = (anonStore[params.p_survey_id] || {})[params.p_token];
+            if (rec) return Promise.resolve({ data: { ok: true, found: true, answers: clone(rec) }, error: null });
+            return Promise.resolve({ data: { ok: true, found: false, answers: null }, error: null });
+          }
+          if (fn === "anon_summary") {
+            const subs = Object.values(anonStore[params.p_survey_id] || {});
+            const perQ = {};
+            subs.forEach((ans) => (ans || []).forEach((a) => {
+              const vals = Array.isArray(a.value) ? a.value : [a.value];
+              perQ[a.qid] = perQ[a.qid] || {};
+              vals.forEach((v) => { if (v != null && v !== "") perQ[a.qid][v] = (perQ[a.qid][v] || 0) + 1; });
+            }));
+            const s = (seed.surveys || []).filter((x) => x.id === params.p_survey_id)[0];
+            const questions = ((s && s.questions) || []).map((q) => {
+              const c = perQ[q.qid] || {};
+              return {
+                qid: q.qid, type: q.type, title: q.title, options: q.options || [],
+                counts: q.type === "text" ? {} : c,
+                texts: q.type === "text" ? Object.keys(c) : [],
+              };
+            });
+            return Promise.resolve({ data: { ok: true, submitted: subs.length, questions }, error: null });
+          }
+          return Promise.resolve({ data: { ok: true }, error: null });
+        },
+      };
+    },
+  },
+};
+
 // ============================================================
 // 四、测试数据 & 加载模块
 // ============================================================
@@ -385,9 +447,11 @@ async function remount() {
   await flush();
 }
 function rows() { return root.querySelectorAll("#collect-list .list-row"); }
-function rowIds() { return rows().map((r) => r.dataset.surveyId); }
-function row(id) { return rows().filter((r) => r.dataset.surveyId === id)[0]; }
-function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(text) >= 0)[0]; }
+// querySelectorAll 返回类 NodeList（无 map/filter），测试自身也要先 slice 成真数组
+const toArr = (l) => Array.prototype.slice.call(l || []);
+function rowIds() { return toArr(rows()).map((r) => r.dataset.surveyId); }
+function row(id) { return toArr(rows()).filter((r) => r.dataset.surveyId === id)[0]; }
+function byText(nodes, text) { return toArr(nodes).filter((n) => n.textContent.indexOf(text) >= 0)[0]; }
 
 (async () => {
   console.log("\n== A. 骨架与 DOM id ==");
@@ -489,7 +553,7 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   click(row("sv_stat"));
   await flush();
   ok(root.querySelector("#collect-detail").hidden === false, "点击列表 → 详情展开");
-  const optCounts = root.querySelectorAll("#collect-detail .opt-count").map((n) => n.textContent);
+  const optCounts = toArr(root.querySelectorAll("#collect-detail .opt-count")).map((n) => n.textContent);
   ok(optCounts.join("|").indexOf("2 票（50%）") >= 0, "结果渲染票数 + 百分比进度条文案");
   ok(root.querySelectorAll("#collect-detail .bar>i").length === 3, "每个选项一条百分比进度条");
   const missingText = root.querySelector("#collect-detail").textContent;
@@ -672,6 +736,88 @@ function byText(nodes, text) { return nodes.filter((n) => n.textContent.indexOf(
   ok(root.querySelector("#ai-summary-box").textContent.indexOf("未开启") >= 0 ||
      root.querySelector("#ai-summary-box").innerHTML.indexOf("未开启") >= 0, "AI 关闭有提示文案");
   aiOn = true;
+
+  console.log("\n== L. 匿名提交（学生端 RPC 链路） ==");
+  setUser("u_s");
+  await remount();
+  ok(row("sv_a") !== undefined && byText(row("sv_a").querySelectorAll(".badge"), "待填写") === undefined,
+    "匿名学生列表不做同步「待填写」判断");
+  rpcCalls = [];
+  click(row("sv_a"));
+  await flush();
+  ok(rpcCalls.some((c) => c.fn === "my_anonymous" && c.params.p_survey_id === "sv_a"),
+    "打开匿名问卷 → 调 my_anonymous");
+  const afill = root.querySelector("#collect-fill-form");
+  ok(afill !== null, "匿名未提交 → 渲染填写表单");
+  ok(root.querySelector("#collect-detail").textContent.indexOf("换设备") >= 0, "匿名填写页有「仅本机」提示");
+
+  const aradios = afill.querySelectorAll('[name="ans_q1"]');
+  ok(aradios.length === 2, "匿名单选渲染为 radio 组");
+  aradios[0].checked = true;
+  rpcCalls = [];
+  dispatch(afill, { type: "submit" });
+  await flush();
+  const anonSub = rpcCalls.filter((c) => c.fn === "submit_anonymous")[0];
+  ok(!!anonSub, "提交匿名问卷 → 调 submit_anonymous");
+  ok(anonSub.params.p_survey_id === "sv_a", "p_survey_id 正确");
+  ok(/^[0-9a-f]{32,}$/.test(anonSub.params.p_token), "p_token 为 32+ 位十六进制");
+  ok(Array.isArray(anonSub.params.p_answers) &&
+     anonSub.params.p_answers[0].qid === "q1" && anonSub.params.p_answers[0].value === "X",
+    "p_answers 为 [{qid,value}] 数组");
+  ok((await CA.store.query("responses", (r) => r.surveyId === "sv_a")).length === 0,
+    "匿名提交不写入 responses 表");
+  ok(root.querySelector("#collect-detail").textContent.indexOf("已提交") >= 0, "提交后回显「已提交」");
+  ok(byText(root.querySelectorAll("#collect-detail .form-actions .btn"), "修改提交") !== undefined,
+    "提交后提供「修改提交」入口");
+
+  // 修改提交：同一 token 覆盖，不新增记录
+  const firstToken = anonSub.params.p_token;
+  click(byText(root.querySelectorAll("#collect-detail .form-actions .btn"), "修改提交"));
+  await flush();
+  const afill2 = root.querySelector("#collect-fill-form");
+  const aradios2 = afill2.querySelectorAll('[name="ans_q1"]');
+  aradios2[0].checked = false; aradios2[1].checked = true;
+  rpcCalls = [];
+  dispatch(afill2, { type: "submit" });
+  await flush();
+  const anonSub2 = rpcCalls.filter((c) => c.fn === "submit_anonymous")[0];
+  ok(!!anonSub2 && anonSub2.params.p_token === firstToken, "修改提交复用同一 token（本机凭据稳定）");
+  ok(Object.keys(anonStore["sv_a"] || {}).length === 1, "同机重复提交只保留一条匿名记录");
+
+  console.log("\n== M. 匿名提交（管理端聚合，不含未交名单） ==");
+  setUser("u_t");
+  await remount();
+  ok(row("sv_a").querySelector(".chip") === null, "匿名收集管理端列表不显示「已交 X/Y」");
+  rpcCalls = [];
+  click(row("sv_a"));
+  await flush();
+  ok(rpcCalls.some((c) => c.fn === "anon_summary" && c.params.p_survey_id === "sv_a"),
+    "管理端打开匿名问卷 → 调 anon_summary");
+  const anonDetText = root.querySelector("#collect-detail").textContent;
+  ok(anonDetText.indexOf("未提交名单") < 0, "匿名管理端不渲染「未提交名单」");
+  ok(anonDetText.indexOf("未提交") < 0, "匿名 KPI 不含「未提交」反推");
+  ok(anonDetText.indexOf("已提交") >= 0, "匿名管理端显示「已提交」");
+  ok(root.querySelectorAll("#collect-detail .opt-row").length === 2, "按问卷选项渲染聚合票数条");
+  ok(anonDetText.indexOf("1 票（100%）") >= 0, "聚合票数正确（修改后为 Y 1 票）");
+  ok(anonDetText.indexOf("李思远") < 0 && anonDetText.indexOf("张天宇") < 0,
+    "聚合结果不含任何成员姓名");
+
+  console.log("\n== N. computeStats 匿名分支（回归非匿名） ==");
+  const anonStats = await CA.collect.computeStats("sv_a");
+  ok(anonStats && anonStats.anonymous === true, "匿名 computeStats 标记 anonymous");
+  ok(Array.isArray(anonStats.missing) && anonStats.missing.length === 0, "匿名 missing = []");
+  ok(Array.isArray(anonStats.missingIds) && anonStats.missingIds.length === 0, "匿名 missingIds = []");
+  const nonAnonStats = await CA.collect.computeStats("sv_stat");
+  ok(nonAnonStats.missing.length === 2 && nonAnonStats.missingIds.length === 2,
+    "非匿名 computeStats 仍返回未提交名单（回归）");
+
+  console.log("\n== O. genAnonToken（纯函数） ==");
+  ok(typeof CA.collect.genAnonToken === "function", "对外暴露 genAnonToken");
+  const t1 = CA.collect.genAnonToken();
+  const t2 = CA.collect.genAnonToken();
+  ok(/^[0-9a-f]{32,}$/.test(t1), "token 为 32+ 位十六进制（字符集/长度）");
+  ok(t1 !== t2, "两次生成不同");
+  ok(CA.collect.anonToken("sv_a") === CA.collect.anonToken("sv_a"), "anonToken 在本机稳定复用");
 
   console.log("\n========================================");
   console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过"}`);

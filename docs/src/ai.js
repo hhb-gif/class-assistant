@@ -295,10 +295,44 @@ CA.ai = (function () {
   }
 
   // ========== 5) 收集结果统计与 AI 归类汇总（M3） ==========
+  // 匿名收集：明细不在 responses 表（服务端 RLS deny all），只能经 PG 函数聚合；
+  // 这里拿到的只有票数与文本，天然不含任何成员身份。
+  async function anonAggregate(surveyId) {
+    try {
+      if (!CA.cloud || !CA.cloud.app) return null;
+      var db = CA.cloud.app.rdb();
+      if (!db || typeof db.rpc !== "function") return null;
+      var res = await db.rpc("anon_summary", { p_survey_id: surveyId });
+      if (res && res.error) return null;
+      var data = (res && Object.prototype.hasOwnProperty.call(res, "data")) ? res.data : res;
+      return (data && data.ok) ? data : null;
+    } catch (e) { return null; }
+  }
+
   // 异步：先读 surveys/responses/members（CA.store 返回 Promise），再本地统计
   async function surveyStats(surveyId) {
     var survey = await CA.store.find("surveys", surveyId);
     if (!survey) return null;
+
+    // 匿名：只给聚合数，绝不输出成员名单（missing 恒为空）
+    if (survey.anonymous) {
+      var agg = await anonAggregate(surveyId);
+      var aq = (agg && Array.isArray(agg.questions)) ? agg.questions : [];
+      return {
+        survey: survey,
+        anonymous: true,
+        total: 0,
+        submitted: (agg && agg.submitted) || 0,
+        missing: [],
+        questions: aq.map(function (q) {
+          return {
+            qid: q.qid, type: q.type, title: q.title, options: q.options || [],
+            counts: q.counts || {}, texts: q.texts || []
+          };
+        })
+      };
+    }
+
     var responses = (await CA.store.get("responses")).filter(function (r) { return r.surveyId === surveyId; });
     var answered = {};
     responses.forEach(function (r) { answered[r.memberId] = true; });
@@ -326,10 +360,16 @@ CA.ai = (function () {
   }
 
   function surveyToMarkdown(obj, stats) {
+    var anon = !!(stats.survey && stats.survey.anonymous);
     var md = ["## " + stats.survey.title + " · 提交汇总"];
-    md.push("- 提交：" + stats.submitted + " / " + stats.total + " 人");
-    if (stats.missing.length) {
-      md.push("- 未提交：" + stats.missing.slice(0, 10).join("、") + (stats.missing.length > 10 ? " 等共 " + stats.missing.length + " 人" : ""));
+    if (anon) {
+      md.push("- 已提交：" + stats.submitted + " 份");
+      md.push("- 匿名收集：不提供未提交名单");
+    } else {
+      md.push("- 提交：" + stats.submitted + " / " + stats.total + " 人");
+      if (stats.missing.length) {
+        md.push("- 未提交：" + stats.missing.slice(0, 10).join("、") + (stats.missing.length > 10 ? " 等共 " + stats.missing.length + " 人" : ""));
+      }
     }
     if (obj && obj.conclusion) { md.push("## 结论"); md.push(String(obj.conclusion)); }
     if (obj && Array.isArray(obj.highlights) && obj.highlights.length) {
@@ -360,7 +400,13 @@ CA.ai = (function () {
     if (!stats) throw new Error("收集表不存在");
     if (!stats.submitted) throw new Error("暂无提交，无法汇总");
 
-    var lines = ["收集表：" + stats.survey.title, "提交：" + stats.submitted + " / " + stats.total + " 人"];
+    var lines = ["收集表：" + stats.survey.title];
+    if (stats.survey && stats.survey.anonymous) {
+      lines.push("说明：匿名收集，仅提供聚合票数与文本，不含任何成员身份，也不要推测未提交者。");
+      lines.push("已提交：" + stats.submitted + " 份");
+    } else {
+      lines.push("提交：" + stats.submitted + " / " + stats.total + " 人");
+    }
     stats.questions.forEach(function (q) {
       lines.push("【" + q.title + "】" + (q.type === "text" ? "文本回答：" : "选项统计："));
       if (q.type === "text") {

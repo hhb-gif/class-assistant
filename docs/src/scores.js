@@ -93,7 +93,12 @@ window.CA = window.CA || {};
     check: '<path d="M20 6 9 17l-5-5"/>',
     star: '<path d="m12 2 3.09 6.26L22 9.27l-5 4.87L18.18 22 12 18.56 5.82 22 7 14.14l-5-4.87 6.91-1.01z"/>',
     clipboard: '<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>',
-    award: '<circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/>'
+    award: '<circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/>',
+    plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+    edit: '<path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
+    trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+    settings: '<circle cx="12" cy="12" r="3"/><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>',
+    close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'
   };
 
   function icon(name, size) {
@@ -459,6 +464,11 @@ window.CA = window.CA || {};
       ".student-hero .stat{background:var(--surface)}" +
       ".student-hero .stat-value{color:var(--primary-text)}" +
       ".subject-meta{display:flex;align-items:center;gap:8px;margin:-2px 0 10px 74px}" +
+      // 考试/科目管理面板（admin）：行式列表 + 操作按钮
+      ".scores-view .manage-list{margin-top:8px}" +
+      ".scores-view .manage-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1.5px solid var(--line);border-radius:var(--r-sm);background:var(--surface)}" +
+      ".scores-view .manage-row .grow{flex:1;min-width:0}" +
+      ".scores-view .manage-row .row{flex:none}" +
       // v4 主色底概览（.card-ink）内的 KPI 浅色磁贴：恢复深色文字（否则 .card-ink 的反白规则会让数字不可见）；
       // 语义色（.stat.success/.warn/.danger/.emphasis，特异度更高）不受影响，仍然生效。
       ".scores-view .stat-value{color:var(--text)}" +
@@ -476,6 +486,24 @@ window.CA = window.CA || {};
   // ---------- 通用 Promise 工具 ----------
   function safe(p, fallback) {
     return Promise.resolve(p).then(function (v) { return v; }, function () { return fallback; });
+  }
+
+  // ---------- 文件导入 ----------
+  // 大文件保护：>2MB 直接拒绝；仅接受 CSV/TXT 文本（Excel 需另存为 CSV）
+  const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
+
+  function readTextFile(file) {
+    return new Promise(function (resolve, reject) {
+      if (typeof FileReader === "undefined") {
+        reject(new Error("当前环境不支持文件读取"));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function () { resolve(String(reader.result == null ? "" : reader.result)); };
+      reader.onerror = function () { reject(new Error("文件读取失败")); };
+      try { reader.readAsText(file, "UTF-8"); }
+      catch (e) { reject(e); }
+    });
   }
 
   // ---------- 数据辅助（读缓存，同步） ----------
@@ -680,18 +708,23 @@ window.CA = window.CA || {};
     // --- 工具栏 ---
     const toolbar = h("div", { class: "card admin-only" });
     const importBtn = makeBtn({ class: "btn btn-primary admin-only", id: "btn-score-import", type: "button" }, "upload", "批量录入");
+    const examManageBtn = makeBtn({ class: "btn btn-quiet btn-labeled admin-only", id: "btn-exam-manage", type: "button" }, "calendar", "考试管理");
+    const subjectManageBtn = makeBtn({ class: "btn btn-quiet btn-labeled admin-only", id: "btn-subject-manage", type: "button" }, "settings", "管理科目");
     toolbar.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("chart", 20), h("span", { text: "成绩中心" })]),
-      importBtn,
+      h("div", { class: "row" }, [examManageBtn, importBtn]),
     ]));
     toolbar.appendChild(h("div", { class: "row" }, [
       h("div", { class: "form-field" }, [h("span", { class: "label", text: "考试" }), buildExamSelect()]),
-      h("div", { class: "form-field" }, [h("span", { class: "label", text: "科目" }), buildSubjectSelect()]),
+      h("div", { class: "form-field" }, [
+        h("span", { class: "label", text: "科目" }),
+        h("div", { class: "row" }, [buildSubjectSelect(), subjectManageBtn]),
+      ]),
     ]));
     box.appendChild(toolbar);
 
     // --- 批量导入面板 ---
-    const importPanel = h("div", { class: "card admin-only", hidden: true });
+    const importPanel = h("div", { class: "card admin-only", id: "score-import-panel", hidden: !state.importOpen });
     importPanel.appendChild(h("div", { class: "card-head" }, [
       h("div", { class: "card-title" }, [iconSpan("clipboard", 18), h("span", { text: "批量录入" })]),
     ]));
@@ -704,12 +737,61 @@ window.CA = window.CA || {};
       importInput,
       h("span", { class: "field-hint", text: "支持中英文逗号、空格、制表符分隔；同一学生同一科目重复行会报错。" }),
     ]));
+    // 文件上传：CSV/TXT 读入文本框后复用解析链路；Excel 暂不支持（需另存为 CSV）
+    const fileInput = h("input", {
+      type: "file", id: "score-import-file",
+      accept: ".csv,.txt,.xlsx,.xls", hidden: true,
+    });
+    const fileBtn = makeBtn({ class: "btn btn-quiet btn-labeled", id: "btn-score-file", type: "button" }, "upload", "选择文件");
+    importPanel.appendChild(h("div", { class: "form-actions manage-actions" }, [fileBtn, fileInput]));
     const parseBtn = makeBtn({ class: "btn btn-quiet btn-labeled", id: "btn-score-parse", type: "button" }, "search", "解析预览");
     const confirmBtn = makeBtn({ class: "btn btn-primary btn-labeled", id: "btn-score-confirm", type: "button", hidden: true }, "check", "确认写入");
-    const previewBox = h("div", { class: "text-sm" });
+    const previewBox = h("div", { class: "text-sm", id: "score-import-preview" });
     importPanel.appendChild(h("div", { class: "form-actions manage-actions" }, [parseBtn, confirmBtn]));
     importPanel.appendChild(previewBox);
     box.appendChild(importPanel);
+
+    // --- 考试管理面板（admin）：列表 + 新增/编辑/删除 ---
+    const examPanel = h("div", { class: "card admin-only", id: "exam-manage-panel", hidden: !state.examPanelOpen });
+    const examAddBtn = makeBtn({ class: "btn btn-primary btn-sm btn-labeled", id: "btn-exam-add", type: "button" }, "plus", "新增考试");
+    examPanel.appendChild(h("div", { class: "card-head" }, [
+      h("div", { class: "card-title" }, [iconSpan("calendar", 18), h("span", { text: "考试管理" })]),
+      examAddBtn,
+    ]));
+    const examForm = h("div", { class: "form-grid", id: "exam-manage-form", hidden: true });
+    const examNameInput = h("input", { class: "input", id: "exam-name-input", type: "text", maxlength: "40", placeholder: "如：第三次月考" });
+    const examDateInput = h("input", { class: "input", id: "exam-date-input", type: "date" });
+    examForm.appendChild(h("div", { class: "form-field" }, [h("span", { class: "label req", text: "考试名称" }), examNameInput]));
+    examForm.appendChild(h("div", { class: "form-field" }, [h("span", { class: "label", text: "考试日期" }), examDateInput]));
+    const examSaveBtn = makeBtn({ class: "btn btn-primary btn-sm btn-labeled", id: "btn-exam-save", type: "button" }, "check", "保存");
+    const examCancelBtn = makeBtn({ class: "btn btn-quiet btn-sm btn-labeled", id: "btn-exam-cancel", type: "button" }, "close", "取消");
+    examForm.appendChild(h("div", { class: "form-actions manage-actions" }, [examSaveBtn, examCancelBtn]));
+    examPanel.appendChild(examForm);
+    const examListEl = h("div", { class: "card-list manage-list", id: "exam-manage-list" });
+    examPanel.appendChild(examListEl);
+    box.appendChild(examPanel);
+
+    // --- 科目管理面板（admin）：列表 + 新增/编辑/删除 ---
+    const subjectPanel = h("div", { class: "card admin-only", id: "subject-manage-panel", hidden: !state.subjectPanelOpen });
+    const subjectAddBtn = makeBtn({ class: "btn btn-primary btn-sm btn-labeled", id: "btn-subject-add", type: "button" }, "plus", "新增科目");
+    subjectPanel.appendChild(h("div", { class: "card-head" }, [
+      h("div", { class: "card-title" }, [iconSpan("book", 18), h("span", { text: "科目管理" })]),
+      subjectAddBtn,
+    ]));
+    const subjectForm = h("div", { class: "form-grid", id: "subject-manage-form", hidden: true });
+    const subjectNameInput = h("input", { class: "input", id: "subject-name-input", type: "text", maxlength: "20", placeholder: "如：生物" });
+    const subjectFullInput = h("input", { class: "input", id: "subject-full-input", type: "number", min: "1", step: "1", value: "100" });
+    const subjectOrderInput = h("input", { class: "input", id: "subject-order-input", type: "number", step: "1", value: "0" });
+    subjectForm.appendChild(h("div", { class: "form-field" }, [h("span", { class: "label req", text: "科目名称" }), subjectNameInput]));
+    subjectForm.appendChild(h("div", { class: "form-field" }, [h("span", { class: "label", text: "满分" }), subjectFullInput]));
+    subjectForm.appendChild(h("div", { class: "form-field" }, [h("span", { class: "label", text: "排序" }), subjectOrderInput]));
+    const subjectSaveBtn = makeBtn({ class: "btn btn-primary btn-sm btn-labeled", id: "btn-subject-save", type: "button" }, "check", "保存");
+    const subjectCancelBtn = makeBtn({ class: "btn btn-quiet btn-sm btn-labeled", id: "btn-subject-cancel", type: "button" }, "close", "取消");
+    subjectForm.appendChild(h("div", { class: "form-actions manage-actions" }, [subjectSaveBtn, subjectCancelBtn]));
+    subjectPanel.appendChild(subjectForm);
+    const subjectListEl = h("div", { class: "card-list manage-list", id: "subject-manage-list" });
+    subjectPanel.appendChild(subjectListEl);
+    box.appendChild(subjectPanel);
 
     // --- 统计卡片（v4：概览用 .card-ink 墨底反白海报块） ---
     const statsCard = h("div", { class: "card card-ink" });
@@ -788,19 +870,253 @@ window.CA = window.CA || {};
     state.copyBtn = copyBtn;
     state.lastComment = "";
 
-    // --- 事件 ---
-    importBtn.addEventListener("click", function () {
-      importPanel.hidden = !importPanel.hidden;
-    });
+    // --- 考试管理：列表 / 表单 / 删除 ---
+    function openExamForm(ex) {
+      state.editingExamId = ex ? ex.id : null;
+      examNameInput.value = ex ? ex.name : "";
+      examDateInput.value = (ex && ex.date) ? String(ex.date).slice(0, 10) : "";
+      examForm.hidden = false;
+      examSaveBtn.__labelText = ex ? "保存修改" : "保存";
+      const lbl = examSaveBtn.querySelector(".btn-label");
+      if (lbl) lbl.textContent = examSaveBtn.__labelText;
+      if (typeof examNameInput.focus === "function") examNameInput.focus();
+    }
 
-    parseBtn.addEventListener("click", function () {
-      // 纯函数解析（用缓存名单/科目，不发请求）
+    function renderExamList() {
+      examListEl.innerHTML = "";
+      const exams = examsSorted();
+      if (!exams.length) {
+        examListEl.innerHTML = '<p class="muted text-sm">暂无考试，点击「新增考试」创建。</p>';
+        return;
+      }
+      exams.forEach(function (ex) {
+        const cnt = (state.scores || []).filter(function (s) { return s.examId === ex.id; }).length;
+        const row = h("div", { class: "manage-row" });
+        row.appendChild(h("div", { class: "grow" }, [
+          h("div", { text: ex.name }),
+          h("div", { class: "muted text-sm", text: (ex.date ? fmtDate(ex.date) : "未设置日期") + " · 已录成绩 " + cnt + " 条" }),
+        ]));
+        const editBtn = makeBtn({ class: "btn btn-quiet btn-sm", id: "btn-exam-edit-" + ex.id, type: "button" }, "edit", "编辑");
+        editBtn.addEventListener("click", function () { openExamForm(ex); });
+        const delBtn = makeBtn({ class: "btn btn-danger btn-sm", id: "btn-exam-del-" + ex.id, type: "button" }, "trash", "删除");
+        delBtn.addEventListener("click", function () { onDeleteExam(ex, delBtn); });
+        row.appendChild(h("div", { class: "row" }, [editBtn, delBtn]));
+        examListEl.appendChild(row);
+      });
+    }
+
+    function onDeleteExam(ex, btn) {
+      const cnt = (state.scores || []).filter(function (s) { return s.examId === ex.id; }).length;
+      let okConfirm = true;
+      try {
+        if (typeof window.confirm === "function") {
+          okConfirm = window.confirm("确定删除考试「" + ex.name + "」吗？该考试下 " + cnt + " 条成绩会一并删除，不可恢复。");
+        }
+      } catch (e) { okConfirm = true; }
+      if (!okConfirm) return Promise.resolve();
+      setBtnLoading(btn, true, "删除中…");
+      // 先删该考试下的成绩，再删考试；任一被 RLS 拒都会走 catch
+      return CA.store.query("scores", function (s) { return s.examId === ex.id; })
+        .then(function (list) {
+          return Promise.all((list || []).map(function (s) { return CA.store.remove("scores", s.id); }));
+        })
+        .then(function () { return CA.store.remove("exams", ex.id); })
+        .then(function () { return reloadExams(); })
+        .then(function () {
+          if (state.examId === ex.id) {
+            const rest = examsSorted();
+            state.examId = rest.length ? rest[0].id : null;
+          }
+          toast("已删除考试", "success");
+          render();
+        })
+        .catch(function (e) {
+          toast((e && e.message) || "删除失败", "error");
+          setBtnLoading(btn, false);
+        });
+    }
+
+    // --- 科目管理：列表 / 表单 / 删除 ---
+    function openSubjectForm(sub) {
+      state.editingSubjectId = sub ? sub.id : null;
+      subjectNameInput.value = sub ? sub.name : "";
+      subjectFullInput.value = sub ? String(sub.fullScore) : "100";
+      subjectOrderInput.value = sub ? String(sub.order || 0) : String(subjectsSorted().length + 1);
+      subjectForm.hidden = false;
+      subjectSaveBtn.__labelText = sub ? "保存修改" : "保存";
+      const lbl = subjectSaveBtn.querySelector(".btn-label");
+      if (lbl) lbl.textContent = subjectSaveBtn.__labelText;
+      if (typeof subjectNameInput.focus === "function") subjectNameInput.focus();
+    }
+
+    function renderSubjectList() {
+      subjectListEl.innerHTML = "";
+      const subjects = subjectsSorted();
+      if (!subjects.length) {
+        subjectListEl.innerHTML = '<p class="muted text-sm">暂无科目，点击「新增科目」创建。</p>';
+        return;
+      }
+      subjects.forEach(function (sub) {
+        const cnt = (state.scores || []).filter(function (s) { return s.subjectId === sub.id; }).length;
+        const row = h("div", { class: "manage-row" });
+        row.appendChild(h("div", { class: "grow" }, [
+          h("div", { text: sub.name + "（满分 " + sub.fullScore + "）" }),
+          h("div", { class: "muted text-sm", text: "排序 " + (sub.order || 0) + " · 已录成绩 " + cnt + " 条" }),
+        ]));
+        const editBtn = makeBtn({ class: "btn btn-quiet btn-sm", id: "btn-subject-edit-" + sub.id, type: "button" }, "edit", "编辑");
+        editBtn.addEventListener("click", function () { openSubjectForm(sub); });
+        const delBtn = makeBtn({ class: "btn btn-danger btn-sm", id: "btn-subject-del-" + sub.id, type: "button" }, "trash", "删除");
+        delBtn.addEventListener("click", function () { onDeleteSubject(sub, delBtn); });
+        row.appendChild(h("div", { class: "row" }, [editBtn, delBtn]));
+        subjectListEl.appendChild(row);
+      });
+    }
+
+    function onDeleteSubject(sub, btn) {
+      const cnt = (state.scores || []).filter(function (s) { return s.subjectId === sub.id; }).length;
+      let okConfirm = true;
+      try {
+        if (typeof window.confirm === "function") {
+          okConfirm = window.confirm("确定删除科目「" + sub.name + "」吗？该科目下 " + cnt + " 条成绩会一并删除，不可恢复。");
+        }
+      } catch (e) { okConfirm = true; }
+      if (!okConfirm) return Promise.resolve();
+      setBtnLoading(btn, true, "删除中…");
+      // 先删该科目下的成绩，再删科目
+      return CA.store.query("scores", function (s) { return s.subjectId === sub.id; })
+        .then(function (list) {
+          return Promise.all((list || []).map(function (s) { return CA.store.remove("scores", s.id); }));
+        })
+        .then(function () { return CA.store.remove("subjects", sub.id); })
+        .then(function () { return reloadSubjects(); })
+        .then(function () {
+          toast("已删除科目", "success");
+          render();
+        })
+        .catch(function (e) {
+          toast((e && e.message) || "删除失败", "error");
+          setBtnLoading(btn, false);
+        });
+    }
+
+    // 解析预览（批量录入 / 文件导入共用，纯函数不吃请求）
+    function runPreview() {
       const parsed = parseImportText(importInput.value, state.members, state.subjects);
       state._parsed = parsed;
       renderPreview(previewBox, parsed);
       confirmBtn.hidden = parsed.okCount === 0;
       if (parsed.okCount === 0 && parsed.failCount === 0) toast("没有可解析的内容", "error");
+    }
+
+    // --- 事件 ---
+    examManageBtn.addEventListener("click", function () {
+      state.examPanelOpen = !state.examPanelOpen;
+      examPanel.hidden = !state.examPanelOpen;
     });
+    subjectManageBtn.addEventListener("click", function () {
+      state.subjectPanelOpen = !state.subjectPanelOpen;
+      subjectPanel.hidden = !state.subjectPanelOpen;
+    });
+    examAddBtn.addEventListener("click", function () { openExamForm(null); });
+    subjectAddBtn.addEventListener("click", function () { openSubjectForm(null); });
+    examSaveBtn.addEventListener("click", function () {
+      const name = String(examNameInput.value || "").trim();
+      const date = String(examDateInput.value || "").trim();
+      if (!name) { toast("请输入考试名称", "error"); return; }
+      if (name.length > 40) { toast("考试名称不能超过 40 字", "error"); return; }
+      const editingId = state.editingExamId;
+      setBtnLoading(examSaveBtn, true, "保存中…");
+      const op = editingId
+        ? CA.store.update("exams", editingId, { name: name, date: date })
+        : CA.store.add("exams", { id: CA.store.uid("ex"), name: name, date: date });
+      Promise.resolve(op)
+        .then(function () { return reloadExams(); })
+        .then(function () {
+          examForm.hidden = true;
+          state.editingExamId = null;
+          toast(editingId ? "考试已更新" : "考试已新增", "success");
+          render();
+        })
+        .catch(function (e) {
+          toast((e && e.message) || "保存失败", "error");
+          setBtnLoading(examSaveBtn, false);
+        });
+    });
+    examCancelBtn.addEventListener("click", function () {
+      examForm.hidden = true;
+      state.editingExamId = null;
+    });
+    subjectSaveBtn.addEventListener("click", function () {
+      const name = String(subjectNameInput.value || "").trim();
+      const fullScore = Number(subjectFullInput.value);
+      const orderNum = parseInt(subjectOrderInput.value, 10);
+      if (!name) { toast("请输入科目名称", "error"); return; }
+      if (name.length > 20) { toast("科目名称不能超过 20 字", "error"); return; }
+      if (!isFinite(fullScore) || fullScore <= 0) { toast("满分需为大于 0 的数字", "error"); return; }
+      const order = isFinite(orderNum) ? orderNum : 0;
+      const editingId = state.editingSubjectId;
+      // 写入用驼峰：store 映射 fullScore→full_score、order→sort_order
+      const payload = { name: name, fullScore: fullScore, order: order };
+      setBtnLoading(subjectSaveBtn, true, "保存中…");
+      const op = editingId
+        ? CA.store.update("subjects", editingId, payload)
+        : CA.store.add("subjects", { id: CA.store.uid("sub"), name: name, fullScore: fullScore, order: order });
+      Promise.resolve(op)
+        .then(function () { return reloadSubjects(); })
+        .then(function () {
+          subjectForm.hidden = true;
+          state.editingSubjectId = null;
+          toast(editingId ? "科目已更新" : "科目已新增", "success");
+          render();
+        })
+        .catch(function (e) {
+          toast((e && e.message) || "保存失败", "error");
+          setBtnLoading(subjectSaveBtn, false);
+        });
+    });
+    subjectCancelBtn.addEventListener("click", function () {
+      subjectForm.hidden = true;
+      state.editingSubjectId = null;
+    });
+
+    importBtn.addEventListener("click", function () {
+      state.importOpen = !state.importOpen;
+      importPanel.hidden = !state.importOpen;
+    });
+
+    // 文件导入：CSV/TXT → 读文本 → 复用解析链路；xlsx/xls 明确拒绝
+    fileBtn.addEventListener("click", function () {
+      if (typeof fileInput.click === "function") fileInput.click();
+    });
+    fileInput.addEventListener("change", function () {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      if (Number(f.size) > MAX_IMPORT_BYTES) {
+        toast("文件过大（超过 2MB），请拆分后再上传", "error");
+        fileInput.value = "";
+        return;
+      }
+      if (/\.(xlsx|xls)$/i.test(String(f.name || ""))) {
+        toast("暂不支持 Excel，请另存为 CSV（UTF-8）后再上传", "error");
+        fileInput.value = "";
+        return;
+      }
+      readTextFile(f).then(function (text) {
+        if (!state) return;
+        if (String(text).indexOf("\uFFFD") >= 0) {
+          toast("文件编码可能不是 UTF-8，请另存为 UTF-8（CSV）后重试", "error");
+          fileInput.value = "";
+          return;
+        }
+        importInput.value = text;
+        runPreview();
+      }).catch(function (e) {
+        toast((e && e.message) || "文件读取失败", "error");
+        fileInput.value = "";
+      });
+    });
+
+    parseBtn.addEventListener("click", runPreview);
 
     confirmBtn.addEventListener("click", function () {
       if (!state._parsed || !state._parsed.okCount) return;
@@ -826,6 +1142,9 @@ window.CA = window.CA || {};
       if (!text) return;
       if (copyText(text)) flashCopied(copyBtn);
     });
+
+    renderExamList();
+    renderSubjectList();
 
     root.appendChild(box);
     refreshStats(statsGrid, statsSub);
@@ -1456,6 +1775,23 @@ window.CA = window.CA || {};
     });
   }
 
+  // 仅刷新考试/科目缓存（管理增删改后调用）；排序口径与 loadAll 一致
+  function reloadExams() {
+    return safe(CA.store.get("exams"), state.exams || []).then(function (list) {
+      state.exams = (list || []).slice().sort(function (a, b) {
+        return String(a.date || "").localeCompare(String(b.date || ""));
+      });
+    });
+  }
+
+  function reloadSubjects() {
+    return safe(CA.store.get("subjects"), state.subjects || []).then(function (list) {
+      state.subjects = (list || []).slice().sort(function (a, b) {
+        return (a.order || 0) - (b.order || 0);
+      });
+    });
+  }
+
   function loadIdentity() {
     if (CA.auth && typeof CA.auth.current === "function") return Promise.resolve(CA.auth.current());
     return Promise.resolve(null);
@@ -1565,6 +1901,11 @@ window.CA = window.CA || {};
       lastComment: "",
       diagBox: null,
       planBox: null,
+      importOpen: false,
+      examPanelOpen: false,
+      subjectPanelOpen: false,
+      editingExamId: null,
+      editingSubjectId: null,
     };
     injectScopedStyles();
     return bootstrap();

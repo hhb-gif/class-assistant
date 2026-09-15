@@ -1,0 +1,11 @@
+{
+  "name": "admin-user",
+  "version": "1.0.0",
+  "private": true,
+  "description": "班级管家账号管理云函数（管理员专用：建号 / 重置密码 / 用户列表）",
+  "main": "index.js",
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.16.0",
+    "tencentcloud-sdk-nodejs-tcb": "^4.0.0"
+  }
+}
