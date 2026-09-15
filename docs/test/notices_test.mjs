@@ -202,6 +202,9 @@ global.CA = {};
 const clone = (x) => (x == null ? x : JSON.parse(JSON.stringify(x)));
 const settle = (v) => Promise.resolve(v);
 
+// 模拟「RLS 静默拦截」开关：置 true 后写操作不报错但数据不变（PostgREST 真实行为）
+let denyWrite = false;
+
 function makeStore(seed) {
   const db = clone(seed);
   // 注意：store.js 的 uid/settings/memberName 保持同步，其余返回 Promise
@@ -226,6 +229,12 @@ function makeStore(seed) {
     },
     update(c, id, patch) {
       const l = db[c] || [];
+      if (denyWrite) {
+        // 模拟 PostgreSQL RLS 拦下越权写入 —— PostgREST 返回「0 行受影响、无 error」，
+        // 记录原样保留。前端若不回读就会把「没改到」当成功。
+        const cur = l.filter((x) => x.id === id)[0];
+        return settle(cur ? clone(cur) : null);
+      }
       for (const x of l) {
         if (x.id === id) { Object.assign(x, patch, { updatedAt: new Date().toISOString() }); return settle(clone(x)); }
       }
@@ -233,6 +242,7 @@ function makeStore(seed) {
     },
     remove(c, id) {
       const l = db[c] || [];
+      if (denyWrite) return settle(true);   // 同上：不报错，但记录没被删掉
       for (let i = 0; i < l.length; i++) if (l[i].id === id) { l.splice(i, 1); return settle(true); }
       return settle(false);
     },
@@ -247,7 +257,10 @@ function makeStore(seed) {
 const users = {
   u_t: { id: "u_t", name: "王老师", role: "superAdmin", title: "班主任" },
   u_a: { id: "u_a", name: "李思远", role: "admin", title: "学习委员" },
-  u_s: { id: "u_s", name: "张天宇", role: "student", title: "学生" },
+  // ⚠️ 必须用真实数据里的角色名 member（不是 "student"）：
+  //    users.role 的取值域是 member|admin|superAdmin（见 ROADMAP §4.3 / auth.js PERMS）。
+  //    历史上测试写成 "student" 会掩盖「按 member 判定」相关的回归。
+  u_s: { id: "u_s", name: "张天宇", role: "member", title: "学生" },
 };
 let currentId = "u_t";
 CA.auth = {
@@ -786,6 +799,50 @@ function formField(name) { return root.querySelector('#notice-form [name="' + na
   await tick();
   ok(storageCalls.signed.length === 0, "无 path 附件不请求签名 URL");
   ok(CA.app.toasts.join("|").indexOf("存储路径") >= 0, "无 path 给出可读提示（非“演示环境不支持”）");
+
+  console.log("\n== N. 权限回归：member（真实角色名）不得管理通知 ==");
+  // 角色取值域是 member|admin|superAdmin；「学生」= member。
+  // 这条用例防止历史上把学生写成 "student" 而掩盖真实判定。
+  setUser("u_s");
+  await remount();
+  ok(CA.auth.can("notice.publish") === false, "member：can(notice.publish) = false");
+  ok(CA.auth.can("notice.manageAll") === false, "member：can(notice.manageAll) = false");
+  ok(root.querySelector("#btn-notice-new").hidden === true, "member：隐藏「发布通知」入口");
+  ok(root.querySelector("#ai-parse-wrap").hidden === true, "member：隐藏 AI 一句话草稿");
+  ok(root.querySelector("#notice-form").hidden === true, "member：发布/编辑表单保持隐藏");
+  click(itemById("n2"));
+  ok(root.querySelector('#notice-detail [data-action="edit"]') === null, "member：详情无「编辑」");
+  ok(root.querySelector('#notice-detail [data-action="delete"]') === null, "member：详情无「删除」");
+  ok(root.querySelector('#notice-detail [data-action="fav"]') !== null, "member：仍可收藏（只读动作保留）");
+
+  console.log("\n== O. RLS 静默拦截必须报错（不能弹「已更新/已删除」） ==");
+  // 越权写入在 PG 里是「0 行受影响 + 无 error」，前端必须回读确认，否则会假成功。
+  setUser("u_a");                 // admin，且 n3 由 u_a 发布（可管理）
+  await remount();
+  click(itemById("n3"));
+  ok(root.querySelector('#notice-detail [data-action="delete"]') !== null, "前置：admin 对自己发布的 n3 有删除按钮");
+
+  denyWrite = true;               // 打开「静默拦截」模拟
+  CA.app.toasts = [];
+  click(root.querySelector('#notice-detail [data-action="delete"]'));
+  await tick(); await tick();
+  ok(CA.app.toasts.indexOf("已删除通知") < 0, "静默拦截：不得弹「已删除通知」");
+  ok(CA.app.toasts.join("|").indexOf("未生效") >= 0, "静默拦截：提示操作未生效");
+  ok((await CA.store.find("notices", "n3")) !== null, "静默拦截：n3 实际仍在（未被误删）");
+
+  // 更新同理：改标题但写入被拦 → 必须报错且旧标题保留
+  CA.app.toasts = [];
+  click(root.querySelector('#notice-detail [data-action="edit"]'));
+  await tick();
+  const titleInput = formField("title");
+  titleInput.value = "被拦截的标题";
+  dispatch(root.querySelector("#notice-form"), { type: "submit" });
+  await tick(); await tick();
+  ok(CA.app.toasts.indexOf("已更新通知") < 0, "静默拦截：不得弹「已更新通知」");
+  ok(CA.app.toasts.join("|").indexOf("未生效") >= 0, "静默拦截：更新提示未生效");
+  const n3row = await CA.store.find("notices", "n3");
+  ok(!!n3row && n3row.title !== "被拦截的标题", "静默拦截：标题未被改写");
+  denyWrite = false;
 
   console.log("\n========================================");
   console.log(`通过 ${passCount} 项断言${failCount ? `，失败 ${failCount} 项` : "，全部通过 ✅"}`);

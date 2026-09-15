@@ -513,11 +513,26 @@ CA.views.notices = (function () {
   // 编辑/删除统一权限判定：
   //  - superAdmin（notice.manageAll）→ 可管理全部
   //  - admin → 仅自己发布的（且拥有发布权）
+  //  - 其他角色（member 等）→ 一律 false
+  // 注意：**先判管理员能力，再比 publisherId**。反过来写会有一个隐患：
+  //   若两边都为 undefined/falsy（数据缺 publisherId、身份未加载完），`undefined === undefined` 为真，
+  //   就会把「非管理员」误判为「发布者本人」。前置 admin 判定可彻底堵死这类退化。
   function canManage(notice) {
     if (!CA.auth || !CA.auth.can) return false;
-    if (CA.auth.can("notice.manageAll")) return true;
+    if (CA.auth.can("notice.manageAll")) return true;          // 超级管理员：全部
+    if (!CA.auth.can("notice.publish")) return false;          // 非管理员：到此为止
     var u = me();
-    return !!(u && notice && notice.publisherId === u.id && CA.auth.can("notice.publish"));
+    return !!(u && notice && notice.publisherId && u.id && notice.publisherId === u.id);
+  }
+
+  // 写后校验：RLS 拦下越权写入时，PostgREST 返回的是「0 行受影响、无 error」，
+  // 前端若不回读就会把「没改到」当成功（例如非管理员改通知时会弹「已更新」）。
+  // 因此更新/删除后必须回读确认，未生效即抛错。
+  function assertApplied(check) {
+    return function (row) {
+      if (!check(row)) throw new Error("操作未生效：无权限，或该记录已被行级安全策略拒绝");
+      return row;
+    };
   }
 
   // ================= 角色（仅用于视觉/布局差异，不参与权限判断） =================
@@ -1168,6 +1183,10 @@ CA.views.notices = (function () {
     state.saving = true;
     setBusy(saveBtn, true, "保存中…");
 
+    // 回读基线：用于识别「被 RLS 静默拦下」的更新（updated_at 不变）
+    var before = editing ? (noticeById[state.editingId] || null) : null;
+    var beforeUpdatedAt = before ? before.updatedAt : null;
+
     // 附件随通知落库（jsonb 数组）
     data.attachments = state.pendingAttachments.slice();
 
@@ -1183,6 +1202,12 @@ CA.views.notices = (function () {
       })());
 
     return Promise.resolve(op).then(function () {
+      if (!editing) return null;
+      // 更新后回读：updated_at 未推进 ⇒ 写入没落地（越权 / 记录已删）→ 视作失败
+      return CA.store.find("notices", state.editingId).then(assertApplied(function (row) {
+        return !!(row && row.updatedAt && row.updatedAt !== beforeUpdatedAt);
+      }));
+    }).then(function () {
       state.formOpen = false;
       state.editingId = null;
       state.pendingAttachments = [];
@@ -1210,6 +1235,11 @@ CA.views.notices = (function () {
       var delBtn = q('#notice-detail [data-action="delete"]');
       setBusy(delBtn, true);
       return CA.store.remove("notices", id).then(function () {
+        // 回读校验：记录仍存在 ⇒ 删除被 RLS 静默拦下（0 行受影响、无 error）
+        return CA.store.find("notices", id).then(assertApplied(function (row) {
+          return !row;
+        }));
+      }).then(function () {
         if (state.detailId === id) state.detailId = null;
         CA.app.toast("已删除通知", "success");
         return refresh();
